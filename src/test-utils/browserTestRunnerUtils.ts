@@ -4,6 +4,7 @@ import path from 'path';
 import { execSync } from 'child_process';
 import * as esbuild from 'esbuild';
 import { fileURLToPath } from 'url';
+import os from 'os';
 
 export const __filename = fileURLToPath(import.meta.url);
 export const __dirname = path.dirname(__filename);
@@ -14,6 +15,23 @@ export const PUBLIC_DIR = path.resolve(ROOT_DIR, 'public');
 
 /** Find Brave Nightly executable */
 export function findBrave(): string {
+    const candidates =
+        os.platform() === 'darwin'
+            ? [
+                '/Applications/Brave Browser Nightly.app/Contents/MacOS/Brave Browser Nightly',
+                '/Applications/Brave Browser.app/Contents/MacOS/Brave Browser',
+            ]
+            : [
+                '/usr/bin/brave-browser-nightly',
+                '/usr/bin/brave-browser',
+                '/usr/bin/brave',
+                '/snap/bin/brave',
+            ];
+
+    for (const candidate of candidates) {
+        if (fs.existsSync(candidate)) return candidate;
+    }
+
     try {
         return execSync(
             'which brave-browser-nightly || which brave-browser || which brave',
