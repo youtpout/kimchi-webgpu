@@ -46,11 +46,14 @@ async function main() {
     const browser = await puppeteer.launch({
         headless: true,
         executablePath: brave,
+        protocolTimeout: 0,
         args: [
             '--enable-unsafe-webgpu',
             '--ignore-gpu-blocklist',
-            '--enable-features=DefaultANGLEVulkan,Vulkan,VulkanFromANGLE',
-            '--disable-features=PdfUseSkiaRenderer',
+            '--enable-features=Vulkan,WebGPU',
+            '--use-angle=vulkan',
+            '--disable-gpu-sandbox',
+            '--no-sandbox',
         ],
     });
 
