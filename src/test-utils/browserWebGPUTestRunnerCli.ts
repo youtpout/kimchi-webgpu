@@ -6,6 +6,27 @@ import {
 } from './browserTestRunnerUtils.js';
 import path from 'path';
 import puppeteer from 'puppeteer';
+import os from 'os';
+
+const platform = os.platform();
+
+const commonArgs = [
+    '--enable-unsafe-webgpu',
+    '--ignore-gpu-blocklist',
+];
+
+const linuxArgs = [
+    '--enable-features=Vulkan,WebGPU',
+    '--use-angle=vulkan',
+    '--disable-vulkan-surface',
+    '--disable-gpu-sandbox',
+    '--no-sandbox',
+];
+
+const macArgs = [
+    '--enable-features=Metal,WebGPU',
+    '--use-angle=metal',
+];
 
 function serializeAny(val: any): any {
     if (typeof val === 'bigint') return val.toString() + 'n';
@@ -48,12 +69,9 @@ async function main() {
         executablePath: brave,
         protocolTimeout: 0,
         args: [
-            '--enable-unsafe-webgpu',
-            '--ignore-gpu-blocklist',
-            '--enable-features=Vulkan,WebGPU',
-            '--use-angle=vulkan',
-            '--disable-gpu-sandbox',
-            '--no-sandbox',
+            ...commonArgs,
+            ...(platform === 'linux' ? linuxArgs : []),
+            ...(platform === 'darwin' ? macArgs : []),
         ],
     });
 
