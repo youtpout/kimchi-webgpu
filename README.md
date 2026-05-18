@@ -130,11 +130,58 @@ If `o1js` allows backend proof decoding for the proof shape you returned, the ex
 
 The converter generates synthetic scalars from the real proof points and the artifact label. This is useful for stressing the GPU MSM pipeline with real Kimchi point sets, but it is not the original proving-time scalar distribution.
 
+## Capture Internal Prover MSMs
+
+The proof-artifact flow above extracts points from the final proof. If you want larger, more prover-like MSM workloads, use the internal capture mode:
+
+- **Capture witness-column commitment MSMs from `proof_create()`**:  
+  `npm run capture:kimchi-internal-msm -- ./dist/src/proof/runCounterProof.js public/datasets/kimchi-internal-msm.json`
+
+This mode hooks the low-level Kimchi `proof_create()` entrypoints and reconstructs witness-column commitment MSM inputs from:
+
+- the real witness columns passed into the prover
+- the real SRS Lagrange basis for the proof domain
+
+Important limitations:
+
+- this path is experimental and depends on `o1js` wasm bindings behavior
+- it is much closer to real prover MSMs than proof-artifact replay
+- if your circuit grows, this is the mode that should produce larger MSM datasets
+
+### Probe Low-Level Kimchi Runtime Calls
+
+Before patching deeper, you can probe which low-level wasm entrypoints are actually hit during proving:
+
+- **Runtime probe**:  
+  `npm run probe:kimchi-runtime -- ./dist/src/proof/runCounterProof.js public/datasets/kimchi-runtime-probe.json`
+
+The probe wraps these candidate functions when they exist:
+
+- `caml_pasta_fp_plonk_proof_create`
+- `caml_pasta_fq_plonk_proof_create`
+- `caml_fp_srs_commit_evaluations`
+- `caml_fq_srs_commit_evaluations`
+- `caml_fp_srs_b_poly_commitment`
+- `caml_fq_srs_b_poly_commitment`
+- `caml_fp_srs_batch_accumulator_generate`
+- `caml_fq_srs_batch_accumulator_generate`
+- `caml_fp_srs_add_lagrange_basis`
+- `caml_fq_srs_add_lagrange_basis`
+
+It probes all three JS-visible layers:
+
+- `kimchi_wasm.cjs`
+- `plonk_wasm.cjs`
+- the live `bindings.wasm` object after `initializeBindings()`
+
+Use it to decide the next step:
+
+- if `proof_create` or `commit_evaluations` calls appear in the report, JS-level interception is still viable
+- if the report stays empty while proving succeeds, the real prover path is bypassing the JS wrappers we can patch here, so extracting true internal MSMs will require a lower-level Kimchi/Rust patch outside this repository
+
 ### Important Note About Curves
 
-The current exporter assumes the standard `o1js` zkApp proof path and emits proof commitments on `curve: "vesta"`.
-
-The current browser MSM replay path in this repository only supports `pallas`, so a direct replay of exported `vesta` proof artifacts will currently be inspected and converted, but skipped for GPU execution. Once a Vesta MSM backend is added, the same artifact flow can be replayed on GPU without changing the export format.
+The proof-artifact parser now detects the actual curve used by the extracted points. In the current `o1js` zkApp proof flow tested here, those replayable proof points were detected as `pallas`, and the browser MSM replay path supports both `pallas` and `vesta`.
 
 ### Counter Example
 

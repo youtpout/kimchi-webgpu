@@ -14,6 +14,8 @@
         "bench:browser": "npm run build && node dist/src/test-utils/browserWebGPUBenchmarkRunner.js",
         "capture:kimchi-msm": "npm run build && node dist/src/tools/exportKimchiCommitmentMsms.js",
         "capture:kimchi-proof": "npm run build && node dist/src/tools/exportKimchiCommitmentMsms.js",
+        "capture:kimchi-internal-msm": "npm run build && node dist/src/tools/exportKimchiInternalMsms.js",
+        "probe:kimchi-runtime": "npm run build && node dist/src/tools/probeKimchiRuntimeCalls.js",
         "inspect:kimchi-proof": "npm run build && node dist/src/tools/inspectKimchiProofArtifacts.js",
         "convert:kimchi-proof-msm": "npm run build && node dist/src/tools/convertKimchiProofArtifactsToMsm.js"
     },
