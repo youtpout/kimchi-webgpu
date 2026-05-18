@@ -13,6 +13,8 @@ const PALLAS_BASE_FIELD =
     0x40000000000000000000000000000000224698fc094cf91b992d30ed00000001n;
 const PALLAS_SCALAR_FIELD =
     0x40000000000000000000000000000000224698fc0994a8dd8c46eb2100000001n;
+const VESTA_BASE_FIELD =
+    0x40000000000000000000000000000000224698fc0994a8dd8c46eb2100000001n;
 
 function isList(node: Sexp): node is Sexp[] {
     return Array.isArray(node);
@@ -218,6 +220,56 @@ function curveScalarField(curve: 'pallas' | 'vesta'): bigint {
     return curve === 'pallas' ? PALLAS_SCALAR_FIELD : PALLAS_BASE_FIELD;
 }
 
+function curveBaseField(curve: 'pallas' | 'vesta'): bigint {
+    return curve === 'pallas' ? PALLAS_BASE_FIELD : VESTA_BASE_FIELD;
+}
+
+function mod(a: bigint, p: bigint): bigint {
+    return ((a % p) + p) % p;
+}
+
+function isPointOnCurve(
+    point: { x: bigint; y: bigint },
+    curve: 'pallas' | 'vesta'
+): boolean {
+    const p = curveBaseField(curve);
+    const lhs = mod(point.y * point.y, p);
+    const rhs = mod(point.x * point.x * point.x + 5n, p);
+    return lhs === rhs;
+}
+
+function isCoordinateInField(
+    coordinate: bigint,
+    curve: 'pallas' | 'vesta'
+): boolean {
+    const p = curveBaseField(curve);
+    return coordinate >= 0n && coordinate < p;
+}
+
+function detectCurveFromPoints(
+    points: { x: bigint; y: bigint }[]
+): 'pallas' | 'vesta' | null {
+    if (points.length === 0) return null;
+
+    const pallasMatches = points.every(
+        (point) =>
+            isCoordinateInField(point.x, 'pallas') &&
+            isCoordinateInField(point.y, 'pallas') &&
+            isPointOnCurve(point, 'pallas')
+    );
+    if (pallasMatches) return 'pallas';
+
+    const vestaMatches = points.every(
+        (point) =>
+            isCoordinateInField(point.x, 'vesta') &&
+            isCoordinateInField(point.y, 'vesta') &&
+            isPointOnCurve(point, 'vesta')
+    );
+    if (vestaMatches) return 'vesta';
+
+    return null;
+}
+
 function labelSeed(label: string): bigint {
     let seed = 0n;
     for (let i = 0; i < label.length; i++) {
@@ -312,6 +364,20 @@ export function enrichKimchiProofArtifact(
         },
     };
 
+    const parsedPoints = [
+        ...flattenCommitmentPoints(parsedArtifact),
+        ...flattenOpeningPoints(parsedArtifact),
+    ];
+    const detectedCurve = detectCurveFromPoints(parsedPoints);
+    if (detectedCurve !== null && detectedCurve !== parsedArtifact.curve) {
+        parsedArtifact.curve = detectedCurve;
+        parsedArtifact.metadata = {
+            ...parsedArtifact.metadata,
+            detectedCurve,
+            curveOverriddenFromSerializedProof: true,
+        };
+    }
+
     return parsedArtifact;
 }
 
@@ -325,6 +391,18 @@ export function summarizeKimchiProofArtifact(artifact: KimchiProofArtifact) {
     }
     const commitmentPoints = flattenCommitmentPoints(enriched);
     const openingPoints = flattenOpeningPoints(enriched);
+    const allPoints = [...commitmentPoints, ...openingPoints];
+    const invalidFieldPoints = allPoints.filter(
+        (point) =>
+            !isCoordinateInField(point.x, enriched.curve) ||
+            !isCoordinateInField(point.y, enriched.curve)
+    );
+    const offCurvePoints = allPoints.filter(
+        (point) =>
+            isCoordinateInField(point.x, enriched.curve) &&
+            isCoordinateInField(point.y, enriched.curve) &&
+            !isPointOnCurve(point, enriched.curve)
+    );
 
     return {
         label: enriched.label,
@@ -337,6 +415,12 @@ export function summarizeKimchiProofArtifact(artifact: KimchiProofArtifact) {
         openingPointCount: openingPoints.length,
         totalReplayPointCount: commitmentPoints.length + openingPoints.length,
         prevChallengeCount: enriched.prevChallenges.length,
+        invalidFieldPointCount: invalidFieldPoints.length,
+        offCurvePointCount: offCurvePoints.length,
+        firstInvalidFieldPoint:
+            invalidFieldPoints.length > 0 ? invalidFieldPoints[0] : undefined,
+        firstOffCurvePoint:
+            offCurvePoints.length > 0 ? offCurvePoints[0] : undefined,
         parserError,
     };
 }
@@ -411,4 +495,32 @@ export function kimchiProofArtifactFileToSyntheticDatasetFile(
 
 export function summarizeKimchiProofArtifactFile(file: KimchiProofArtifactFile) {
     return file.artifacts.map(summarizeKimchiProofArtifact);
+}
+
+export function validateSyntheticDatasetPoints(dataset: KimchiMsmDataset): {
+    invalidFieldPointCount: number;
+    offCurvePointCount: number;
+    firstInvalidFieldPoint?: { x: bigint; y: bigint };
+    firstOffCurvePoint?: { x: bigint; y: bigint };
+} {
+    const invalidFieldPoints = dataset.points.filter(
+        (point) =>
+            !isCoordinateInField(point.x, dataset.curve) ||
+            !isCoordinateInField(point.y, dataset.curve)
+    );
+    const offCurvePoints = dataset.points.filter(
+        (point) =>
+            isCoordinateInField(point.x, dataset.curve) &&
+            isCoordinateInField(point.y, dataset.curve) &&
+            !isPointOnCurve(point, dataset.curve)
+    );
+
+    return {
+        invalidFieldPointCount: invalidFieldPoints.length,
+        offCurvePointCount: offCurvePoints.length,
+        firstInvalidFieldPoint:
+            invalidFieldPoints.length > 0 ? invalidFieldPoints[0] : undefined,
+        firstOffCurvePoint:
+            offCurvePoints.length > 0 ? offCurvePoints[0] : undefined,
+    };
 }

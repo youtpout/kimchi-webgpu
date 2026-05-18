@@ -29,6 +29,18 @@ async function main() {
         console.log(`Opening points: ${summary.openingPointCount}`);
         console.log(`Replayable points total: ${summary.totalReplayPointCount}`);
         console.log(`Previous challenges: ${summary.prevChallengeCount}`);
+        console.log(`Invalid field points: ${summary.invalidFieldPointCount}`);
+        console.log(`Off-curve points: ${summary.offCurvePointCount}`);
+        if (summary.firstInvalidFieldPoint) {
+            console.log(
+                `First invalid field point: x=${summary.firstInvalidFieldPoint.x} y=${summary.firstInvalidFieldPoint.y}`
+            );
+        }
+        if (summary.firstOffCurvePoint) {
+            console.log(
+                `First off-curve point: x=${summary.firstOffCurvePoint.x} y=${summary.firstOffCurvePoint.y}`
+            );
+        }
         if (summary.parserError) {
             console.log(`Parser error: ${summary.parserError}`);
         }

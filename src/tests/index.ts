@@ -12,3 +12,4 @@ import '../gpu/256bit/pallas/sub.spec.js';
 import '../gpu/256bit/pallas/mul.spec.js';
 import '../gpu/256bit/pallas/msm.spec.js';
 import '../gpu/256bit/pallas/pippenger_msm.spec.js';
+import '../gpu/256bit/vesta/pippenger_msm.spec.js';

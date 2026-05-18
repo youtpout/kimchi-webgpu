@@ -3,7 +3,12 @@ import {
     createPippengerMSMPallasRunner,
     pippengerMSMPallas,
 } from '../gpu/256bit/pallas/pippenger_msm.js';
+import {
+    createPippengerMSMVestaRunner,
+    pippengerMSMVesta,
+} from '../gpu/256bit/vesta/pippenger_msm.js';
 import { kimchiMsmDatasetFileFromJson } from '../datasets/kimchiMsmDataset.js';
+import type { Point } from '../types/point.js';
 
 async function getDevice(): Promise<GPUDevice> {
     const adapter = await navigator.gpu.requestAdapter();
@@ -49,6 +54,38 @@ async function runTimed(
     return { result, timingsMs };
 }
 
+function createRunner(
+    device: GPUDevice,
+    curve: 'pallas' | 'vesta'
+): {
+    run: (
+        scalars: bigint[],
+        points: Point[],
+        config?: { verbose?: boolean }
+    ) => Promise<Point>;
+} {
+    return curve === 'pallas'
+        ? createPippengerMSMPallasRunner(device, { bucketWidthBits: 8 })
+        : createPippengerMSMVestaRunner(device, { bucketWidthBits: 8 });
+}
+
+async function runCold(
+    device: GPUDevice,
+    curve: 'pallas' | 'vesta',
+    scalars: bigint[],
+    points: Point[]
+): Promise<Point> {
+    return curve === 'pallas'
+        ? pippengerMSMPallas(device, scalars, points, {
+              bucketWidthBits: 8,
+              verbose: false,
+          })
+        : pippengerMSMVesta(device, scalars, points, {
+              bucketWidthBits: 8,
+              verbose: false,
+          });
+}
+
 const requestedDataset = new URLSearchParams(window.location.search).get(
     'dataset'
 );
@@ -77,23 +114,17 @@ if (requestedDataset) {
                     console.log(`MSM kind: ${dataset.msmKind}`);
                     console.log(`Point count: ${dataset.pointCount}`);
 
-                    if (dataset.curve !== 'pallas') {
-                        throw new Error(
-                            `Dataset ${dataset.label} uses curve=${dataset.curve}, but the current GPU replay path only supports pallas`
-                        );
-                    }
-
                     expect(dataset.scalars.length).to.equal(
                         dataset.points.length,
                         `${dataset.label} scalar/point length mismatch`
                     );
 
                     const coldStart = performance.now();
-                    const coldResult = await pippengerMSMPallas(
+                    const coldResult = await runCold(
                         device,
+                        dataset.curve,
                         dataset.scalars,
-                        dataset.points,
-                        { bucketWidthBits: 8, verbose: false }
+                        dataset.points
                     );
                     const coldMs = performance.now() - coldStart;
 
@@ -102,9 +133,7 @@ if (requestedDataset) {
                         `Cold result x: ${coldResult.x.toString().slice(0, 24)}...`
                     );
 
-                    const runner = createPippengerMSMPallasRunner(device, {
-                        bucketWidthBits: 8,
-                    });
+                    const runner = createRunner(device, dataset.curve);
                     await runner.run(dataset.scalars, dataset.points, {
                         verbose: false,
                     });
