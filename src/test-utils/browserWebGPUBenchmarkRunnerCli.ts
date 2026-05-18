@@ -10,10 +10,7 @@ import os from 'os';
 
 const platform = os.platform();
 
-const commonArgs = [
-    '--enable-unsafe-webgpu',
-    '--ignore-gpu-blocklist',
-];
+const commonArgs = ['--enable-unsafe-webgpu', '--ignore-gpu-blocklist'];
 
 const linuxArgs = [
     '--enable-features=Vulkan,WebGPU',
@@ -23,47 +20,27 @@ const linuxArgs = [
     '--no-sandbox',
 ];
 
-const macArgs = [
-    '--enable-features=Metal,WebGPU',
-    '--use-angle=metal',
-];
-
-function serializeAny(val: any): any {
-    if (typeof val === 'bigint') return val.toString() + 'n';
-    if (typeof val === 'function') return '[Function]';
-    if (val instanceof Error) return { message: val.message, stack: val.stack };
-    if (Array.isArray(val)) return val.map(serializeAny);
-
-    if (ArrayBuffer.isView(val)) {
-        // Treat all ArrayBufferViews as unserializable
-        return '[Unserializable]';
-    }
-
-    if (val && typeof val === 'object') {
-        const res: any = {};
-        for (const key of Object.keys(val)) {
-            try {
-                console.log(val[key], key);
-                res[key] = serializeAny(val[key]);
-            } catch {
-                res[key] = '[Unserializable]';
-            }
-        }
-        return res;
-    }
-
-    return val;
-}
+const macArgs = ['--enable-features=Metal,WebGPU', '--use-angle=metal'];
 
 async function main() {
-    const entryFile = path.resolve(ROOT_DIR, 'src/tests/index.ts');
-    await bundleTests(entryFile, 'bundle.tests.js', 'index.tests.html');
+    const entryFile = path.resolve(ROOT_DIR, 'src/benchmarks/index.ts');
+    await bundleTests(
+        entryFile,
+        'bundle.benchmarks.js',
+        'index.benchmarks.html'
+    );
 
+    const extraQuery = process.argv[2] ?? '';
     const { url: baseUrl } = await startServer();
-    const url = baseUrl.replace('/index.html', '/index.tests.html');
-
+    const benchmarkBaseUrl = baseUrl.replace(
+        '/index.html',
+        '/index.benchmarks.html'
+    );
+    const url = extraQuery
+        ? `${benchmarkBaseUrl}${extraQuery}`
+        : benchmarkBaseUrl;
     const brave = findBrave();
-    console.log('Launching headless Brave for tests');
+    console.log('Launching headless Brave for benchmarks');
 
     const browser = await puppeteer.launch({
         headless: true,
@@ -84,25 +61,18 @@ async function main() {
                 try {
                     return await a.jsonValue();
                 } catch {
-                    try {
-                        return await a.evaluate(
-                            (v, serializer) => serializer(v),
-                            serializeAny
-                        );
-                    } catch {
-                        return '[Unserializable]';
-                    }
+                    return '[Unserializable]';
                 }
             })
         );
 
-        // Skip empty console messages
         if (
             args.length === 0 ||
             (args.length === 1 &&
                 (args[0] === '' || args[0] === null || args[0] === undefined))
-        )
+        ) {
             return;
+        }
 
         console.log('[browser]', ...args);
     });
@@ -118,7 +88,8 @@ async function main() {
         () => (window as any).testsFailures || 0
     );
 
-    console.log(`Tests finished. Failures: ${failuresCount}`);
+    console.log(`Benchmarks finished. Failures: ${failuresCount}`);
+    await browser.close();
     process.exit(failuresCount ? 1 : 0);
 }
 

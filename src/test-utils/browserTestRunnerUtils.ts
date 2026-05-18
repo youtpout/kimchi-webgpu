@@ -61,7 +61,8 @@ export async function startServer(port = 3001) {
 /** Bundle all tests into ESM for browser */
 export async function bundleTests(
     entryFile: string,
-    outFile = 'bundle.tests.js'
+    outFile = 'bundle.tests.js',
+    htmlFile = 'index.html'
 ) {
     if (!fs.existsSync(PUBLIC_DIR))
         fs.mkdirSync(PUBLIC_DIR, { recursive: true });
@@ -81,9 +82,8 @@ export async function bundleTests(
     });
 
     // Create a minimal index.html if missing
-    const htmlPath = path.resolve(PUBLIC_DIR, 'index.html');
-    if (!fs.existsSync(htmlPath)) {
-        const html = `<!DOCTYPE html>
+    const htmlPath = path.resolve(PUBLIC_DIR, htmlFile);
+    const html = `<!DOCTYPE html>
 <html lang="en">
 <head><meta charset="UTF-8"><title>WebGPU Tests</title></head>
 <body>
@@ -101,8 +101,7 @@ export async function bundleTests(
 </script>
 </body>
 </html>`;
-        fs.writeFileSync(htmlPath, html, 'utf-8');
-    }
+    fs.writeFileSync(htmlPath, html, 'utf-8');
 
     return outfile;
 }

@@ -3,11 +3,17 @@ import path from 'path';
 import { spawn } from 'child_process';
 
 async function main() {
-  const entryFile = path.resolve(ROOT_DIR, 'src/tests/index.ts');
-  await bundleTests(entryFile, 'bundle.tests.js', 'index.tests.html');
+  const entryFile = path.resolve(ROOT_DIR, 'src/benchmarks/index.ts');
+  await bundleTests(
+    entryFile,
+    'bundle.benchmarks.js',
+    'index.benchmarks.html'
+  );
 
+  const extraQuery = process.argv[2] ?? '';
   const { url: baseUrl } = await startServer();
-  const url = baseUrl.replace('/index.html', '/index.tests.html');
+  const benchmarkBaseUrl = baseUrl.replace('/index.html', '/index.benchmarks.html');
+  const url = extraQuery ? `${benchmarkBaseUrl}${extraQuery}` : benchmarkBaseUrl;
   const brave = findBrave();
 
   console.log('Opening Brave at', url);
@@ -22,7 +28,7 @@ async function main() {
       url,
     ],
     { stdio: 'inherit', detached: true }
-  ).unref(); // unref allows Node to exit independently
+  ).unref();
 }
 
 main().catch(console.error);

@@ -9,7 +9,9 @@
         "build:wgsl": "cpx \"src/**/*.wgsl\" dist/src",
         "copy:types": "cpx \"src/types/**/*.d.ts\" dist/types/",
         "test:browser-cli": "npm run build && node dist/src/test-utils/browserWebGPUTestRunnerCli.js",
-        "test:browser": "npm run build && node dist/src/test-utils/browserWebGPUTestRunner.js"
+        "test:browser": "npm run build && node dist/src/test-utils/browserWebGPUTestRunner.js",
+        "bench:browser-cli": "npm run build && node dist/src/test-utils/browserWebGPUBenchmarkRunnerCli.js",
+        "bench:browser": "npm run build && node dist/src/test-utils/browserWebGPUBenchmarkRunner.js"
     },
     "keywords": [
         "Kimchi",
