@@ -255,6 +255,11 @@ function readBenchmarkConfig(): BenchmarkConfig {
     return { cases, rounds };
 }
 
+const shouldRunDefaultBenchmark =
+    !new URLSearchParams(window.location.search).get('dataset') &&
+    !new URLSearchParams(window.location.search).get('proofArtifact');
+
+if (shouldRunDefaultBenchmark) {
 describe('Pippenger MSM benchmark with valid Pallas data', () => {
     (it as any)(
         'measures correctness on small sets and throughput on larger sets',
@@ -347,3 +352,4 @@ describe('Pippenger MSM benchmark with valid Pallas data', () => {
         1_800_000
     );
 });
+}

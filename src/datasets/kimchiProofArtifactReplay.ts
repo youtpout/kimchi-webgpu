@@ -80,7 +80,14 @@ function parseSexpTokens(tokens: string[], cursor: { index: number }): Sexp {
 }
 
 function parseSerializedProofSexp(input: string): Sexp {
-    const decoded = Buffer.from(input, 'base64').toString('utf8');
+    const decoded =
+        typeof Buffer !== 'undefined'
+            ? Buffer.from(input, 'base64').toString('utf8')
+            : decodeURIComponent(
+                  Array.from(atob(input), (char) =>
+                      `%${char.charCodeAt(0).toString(16).padStart(2, '0')}`
+                  ).join('')
+              );
     const tokens = tokenizeSexp(decoded);
     const cursor = { index: 0 };
     const parsed = parseSexpTokens(tokens, cursor);
@@ -138,6 +145,9 @@ function findRecursiveNamed(node: Sexp, name: string): Sexp[] | null {
 function parseFieldAtom(atom: Sexp): bigint {
     if (!isAtom(atom)) {
         throw new Error('Expected field atom in serialized proof');
+    }
+    if (/^(0x)?[0-9a-fA-F]+$/.test(atom)) {
+        return BigInt(atom.startsWith('0x') ? atom : `0x${atom}`);
     }
     return BigInt(atom);
 }
