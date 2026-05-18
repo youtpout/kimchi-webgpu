@@ -62,6 +62,9 @@ The benchmark uses valid Pallas curve points, verifies CPU/GPU equality on small
 - **Replay an exported Kimchi MSM dataset**:  
   `npm run bench:browser-cli -- '?dataset=datasets/kimchi-commit-evals.json&rounds=3'`
 
+- **Inspect and benchmark exported Kimchi proof artifacts**:  
+  `npm run bench:browser-cli -- '?proofArtifact=datasets/counter-proof-artifacts.json&rounds=3'`
+
 ### Benchmark Query Params
 
 - `sizes`: comma-separated list of MSM sizes
@@ -69,12 +72,16 @@ The benchmark uses valid Pallas curve points, verifies CPU/GPU equality on small
 - `rounds`: number of measured warm GPU runs
 - `bucketWidthBits`: forces a fixed bucket width for all cases
 - `dataset`: path under `public/` to an exported Kimchi MSM dataset JSON file
+- `proofArtifact`: path under `public/` to an exported Kimchi proof artifact JSON file
 
-## Extract Real Kimchi MSM Datasets
+## Export Real Kimchi Proof Artifacts
 
-The repository includes a capture tool that instruments `o1js` during proving and dumps real SRS commitment MSM inputs.
+The repository includes a capture tool that runs a real `o1js` proving flow and exports the resulting Kimchi proof artifacts in a structured JSON format.
 
 - **CLI entrypoint**:  
+  `npm run capture:kimchi-proof -- <proving-module> [out-file]`
+
+- **Backward-compatible alias**:  
   `npm run capture:kimchi-msm -- <proving-module> [out-file]`
 
 The proving module must export one of:
@@ -84,32 +91,50 @@ The proving module must export one of:
 - `main`
 - `prove`
 
-That exported function should run your normal `o1js` proving flow. While it runs, the capture tool intercepts real calls to:
+That exported function should run your normal `o1js` proving flow and return the proved transaction, or an object that contains it. The exporter reads the actual `o1js` proof objects from that result and writes:
 
-- `caml_fp_srs_commit_evaluations(...)`
-- `caml_fq_srs_commit_evaluations(...)`
+- witness commitments `w_comm`
+- quotient commitments `t_comm`
+- permutation commitment `z_comm`
+- opening proof pairs `lr`
+- opening proof points `delta` and `sg`
+- previous recursion challenges
+- the serialized proof blob from `o1js`
 
-and writes them as replayable MSM datasets.
+This is a proof-artifact export path, not an internal prover-MSM hook. It is stable in JS land and gives you real Kimchi proof data you can inspect or transform into replay workloads later.
 
-### Example Capture Flow
+If `o1js` allows backend proof decoding for the proof shape you returned, the exporter also fills the structured commitment and opening-proof fields. If not, it falls back to a serialized-proof export and records the reason in `metadata.backendProofDecodeError`.
 
-1. Create a proving module, for example `scripts/run-my-proof.js`, that generates a real Kimchi proof.
+### Example Export Flow
+
+1. Create a proving module, for example `scripts/run-my-proof.js`, that generates a real Kimchi proof and returns the proved transaction.
 2. Run:
 
-   `npm run capture:kimchi-msm -- ./scripts/run-my-proof.js public/datasets/kimchi-commit-evals.json`
+   `npm run capture:kimchi-proof -- ./scripts/run-my-proof.js public/datasets/kimchi-proof-artifacts.json`
 
-3. Replay the captured datasets in the browser:
+3. Inspect the exported artifact JSON under `public/datasets/`.
 
-   `npm run bench:browser-cli -- '?dataset=datasets/kimchi-commit-evals.json&rounds=3'`
+### Inspect, Convert, and Replay Proof Artifacts
+
+- **Inspect a captured proof artifact file**:  
+  `npm run inspect:kimchi-proof -- public/datasets/counter-proof-artifacts.json`
+
+- **Convert proof artifacts into synthetic replay MSM datasets**:  
+  `npm run convert:kimchi-proof-msm -- public/datasets/counter-proof-artifacts.json public/datasets/counter-proof-synthetic-msm.json`
+
+- **Replay the converted synthetic datasets in the browser benchmark**:  
+  `npm run bench:browser-cli -- '?dataset=datasets/counter-proof-synthetic-msm.json&rounds=3'`
+
+- **Run the proof-artifact-aware browser benchmark directly**:  
+  `npm run bench:browser-cli -- '?proofArtifact=datasets/counter-proof-artifacts.json&rounds=3'`
+
+The converter generates synthetic scalars from the real proof points and the artifact label. This is useful for stressing the GPU MSM pipeline with real Kimchi point sets, but it is not the original proving-time scalar distribution.
 
 ### Important Note About Curves
 
-Real Kimchi prover MSMs can be on either Pasta curve.
+The current exporter assumes the standard `o1js` zkApp proof path and emits proof commitments on `curve: "vesta"`.
 
-- `fp` SRS commitment datasets are exported as `curve: "vesta"`
-- `fq` SRS commitment datasets are exported as `curve: "pallas"`
-
-The current GPU replay path in this repository only supports `pallas`. So the capture path is ready for real prover extraction now, but replaying `vesta` datasets on the GPU will require a Vesta backend to be added.
+The current browser MSM replay path in this repository only supports `pallas`, so a direct replay of exported `vesta` proof artifacts will currently be inspected and converted, but skipped for GPU execution. Once a Vesta MSM backend is added, the same artifact flow can be replayed on GPU without changing the export format.
 
 ### Counter Example
 
@@ -117,13 +142,19 @@ This repository includes a minimal proving entrypoint for the sample counter con
 
 - Proving module: [runCounterProof.ts](/home/eddy/Projects/kimchi-webgpu/src/proof/runCounterProof.ts)
 
-Capture MSM datasets from that proof flow with:
+Export proof artifacts from that proof flow with:
 
-`npm run capture:kimchi-msm -- ./dist/src/proof/runCounterProof.js public/datasets/counter-commit-evals.json`
+`npm run capture:kimchi-proof -- ./dist/src/proof/runCounterProof.js public/datasets/counter-proof-artifacts.json`
 
-Replay the exported datasets with:
+The proving entrypoint returns the proved `incrementTx`, so the exporter can read the generated proof objects directly.
 
-`npm run bench:browser-cli -- '?dataset=datasets/counter-commit-evals.json&rounds=3'`
+Inspect the result with:
+
+`npm run inspect:kimchi-proof -- public/datasets/counter-proof-artifacts.json`
+
+Convert it into replay datasets with:
+
+`npm run convert:kimchi-proof-msm -- public/datasets/counter-proof-artifacts.json public/datasets/counter-proof-synthetic-msm.json`
 
 # Browser Proving Note
 

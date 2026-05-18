@@ -10,7 +10,12 @@ export interface KimchiMsmDatasetJson {
     label: string;
     source: string;
     curve: KimchiCurveName;
-    msmKind: 'srs-commit-evaluations';
+    msmKind:
+        | 'srs-commit-evaluations'
+        | 'witness-column-commitment'
+        | 'proof-commitments-synthetic'
+        | 'proof-opening-synthetic'
+        | 'proof-all-points-synthetic';
     domainSize?: number;
     pointCount: number;
     scalars: string[];
@@ -23,7 +28,12 @@ export interface KimchiMsmDataset {
     label: string;
     source: string;
     curve: KimchiCurveName;
-    msmKind: 'srs-commit-evaluations';
+    msmKind:
+        | 'srs-commit-evaluations'
+        | 'witness-column-commitment'
+        | 'proof-commitments-synthetic'
+        | 'proof-opening-synthetic'
+        | 'proof-all-points-synthetic';
     domainSize?: number;
     pointCount: number;
     scalars: bigint[];

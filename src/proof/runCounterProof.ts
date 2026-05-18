@@ -3,11 +3,13 @@ import {
     Field,
     Mina,
     PrivateKey,
+    setNumberOfWorkers,
     setBackend,
 } from 'o1js';
 import { SimpleCounter } from './counter.js';
 
 setBackend('wasm');
+setNumberOfWorkers(0);
 
 export async function run() {
     const Local = await Mina.LocalBlockchain({ proofsEnabled: true });
@@ -44,6 +46,7 @@ export async function run() {
 
     return {
         finalCounter: finalCounter.toString(),
+        incrementTx,
     };
 }
 

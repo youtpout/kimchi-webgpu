@@ -12,7 +12,10 @@
         "test:browser": "npm run build && node dist/src/test-utils/browserWebGPUTestRunner.js",
         "bench:browser-cli": "npm run build && node dist/src/test-utils/browserWebGPUBenchmarkRunnerCli.js",
         "bench:browser": "npm run build && node dist/src/test-utils/browserWebGPUBenchmarkRunner.js",
-        "capture:kimchi-msm": "npm run build && node dist/src/tools/exportKimchiCommitmentMsms.js"
+        "capture:kimchi-msm": "npm run build && node dist/src/tools/exportKimchiCommitmentMsms.js",
+        "capture:kimchi-proof": "npm run build && node dist/src/tools/exportKimchiCommitmentMsms.js",
+        "inspect:kimchi-proof": "npm run build && node dist/src/tools/inspectKimchiProofArtifacts.js",
+        "convert:kimchi-proof-msm": "npm run build && node dist/src/tools/convertKimchiProofArtifactsToMsm.js"
     },
     "keywords": [
         "Kimchi",

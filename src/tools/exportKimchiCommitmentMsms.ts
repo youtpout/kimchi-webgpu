@@ -2,180 +2,262 @@ import fs from 'fs';
 import path from 'path';
 import { createRequire } from 'module';
 import { fileURLToPath, pathToFileURL } from 'url';
-import {
-    kimchiMsmDatasetFileToJson,
-} from '../datasets/kimchiMsmDataset.js';
+import { enrichKimchiProofArtifact } from '../datasets/kimchiProofArtifactReplay.js';
+import { kimchiProofArtifactFileToJson } from '../datasets/kimchiProofArtifacts.js';
 import type {
-    KimchiCurveName,
-    KimchiMsmDataset,
-    KimchiMsmDatasetFile,
-} from '../datasets/kimchiMsmDataset.js';
+    KimchiProofArtifact,
+    KimchiProofArtifactFile,
+    KimchiOpeningPair,
+    KimchiPolyComm,
+    KimchiRecursionChallenge,
+} from '../datasets/kimchiProofArtifacts.js';
 
 process.env.O1JS_BACKEND = 'wasm';
 
 const require = createRequire(import.meta.url);
 const o1jsEntrypointPath = require.resolve('o1js');
 const o1jsPackageRoot = path.resolve(path.dirname(o1jsEntrypointPath), '..', '..');
-const wasm = require(
-    path.join(
-        o1jsPackageRoot,
-        'dist/node/bindings/compiled/node_bindings/plonk_wasm.cjs'
-    )
-) as any;
-const { getRustConversion } = (await import(
-    pathToFileURL(
-        path.join(o1jsPackageRoot, 'dist/node/bindings/crypto/bindings.js')
-    ).href
+const bindingsModule = (await import(
+    pathToFileURL(path.join(o1jsPackageRoot, 'dist/node/bindings.js')).href
 )) as {
-    getRustConversion: (rust: any) => any;
+    initializeBindings: () => Promise<void>;
+    Snarky: {
+        circuit: {
+            proofToBackendProofEvals: (
+                publicInput: unknown,
+                proof: unknown
+            ) => unknown;
+        };
+    };
 };
-
-type FieldName = 'fp' | 'fq';
-type OriginalCommitEvaluationsFn = (
-    srs: unknown,
-    domainSize: number,
-    evals: Uint8Array
-) => unknown;
+const { MlFieldConstArray } = (await import(
+    pathToFileURL(path.join(o1jsPackageRoot, 'dist/node/lib/ml/fields.js')).href
+)) as {
+    MlFieldConstArray: {
+        to: (fields: unknown[]) => unknown;
+    };
+};
 
 interface CaptureOptions {
     outFile?: string;
-    minDomainSize?: number;
-    maxDatasets?: number;
     sourceLabel?: string;
 }
 
-const FIELD_TO_CURVE: Record<FieldName, KimchiCurveName> = {
-    fp: 'vesta',
-    fq: 'pallas',
-};
+interface ProofLike {
+    proof: unknown;
+    maxProofsVerified: number;
+    publicFields: () => {
+        input: { toString(): string }[];
+        output: { toString(): string }[];
+    };
+    toJSON?: () => {
+        proof: string;
+        publicInput: string[];
+        publicOutput: string[];
+        maxProofsVerified: number;
+    };
+}
+
+function isObject(value: unknown): value is Record<string, unknown> {
+    return typeof value === 'object' && value !== null;
+}
+
+function isProofLike(value: unknown): value is ProofLike {
+    return (
+        isObject(value) &&
+        'proof' in value &&
+        'maxProofsVerified' in value &&
+        'publicFields' in value &&
+        typeof value.publicFields === 'function'
+    );
+}
 
 function mlArrayItems<T>(mlArray: [0, ...T[]]): T[] {
     return mlArray.slice(1) as T[];
 }
 
-function polyCommToAffinePoint(polyComm: any): { x: bigint; y: bigint } {
-    const elems = mlArrayItems(polyComm[1]);
-    if (elems.length !== 1) {
-        throw new Error(
-            `Expected a PolyComm with exactly one affine point, received ${elems.length}`
-        );
-    }
-    const point = elems[0] as any;
-    if (point === 0) {
-        throw new Error('Unexpected point at infinity in lagrange basis commitment');
-    }
+function orInfinityToPoint(point: any): { x: bigint; y: bigint } | null {
+    if (point === 0) return null;
+
     return {
         x: point[1][1][1],
         y: point[1][2][1],
     };
 }
 
+function polyCommToJson(polyComm: any) {
+    return {
+        unshifted: mlArrayItems(polyComm[1]).map(orInfinityToPoint),
+    };
+}
+
+function extractProofArtifacts(
+    proofLike: ProofLike,
+    label: string,
+    source: string
+): KimchiProofArtifact {
+    const publicFields = proofLike.publicFields();
+    const emptyPolyComm: KimchiPolyComm = { unshifted: [] };
+    const emptyOpeningPairs: KimchiOpeningPair[] = [];
+    const emptyPrevChallenges: KimchiRecursionChallenge[] = [];
+    const baseArtifact: KimchiProofArtifact = {
+        version: 1 as const,
+        label,
+        source,
+        curve: 'vesta' as const,
+        maxProofsVerified: proofLike.maxProofsVerified,
+        publicInput: publicFields.input.map((field) => BigInt(field.toString())),
+        publicOutput: publicFields.output.map((field) => BigInt(field.toString())),
+        commitments: {
+            wComm: [],
+            zComm: emptyPolyComm,
+            tComm: emptyPolyComm,
+        },
+        openingProof: {
+            lr: emptyOpeningPairs,
+            delta: null,
+            z1: 0n,
+            z2: 0n,
+            sg: null,
+        },
+        prevChallenges: emptyPrevChallenges,
+        serializedProof: proofLike.toJSON?.(),
+    };
+
+    let proofWithEvals: any;
+    try {
+        proofWithEvals = bindingsModule.Snarky.circuit.proofToBackendProofEvals(
+            MlFieldConstArray.to(publicFields.input),
+            proofLike.proof
+        ) as any;
+    } catch (error) {
+        return enrichKimchiProofArtifact({
+            ...baseArtifact,
+            metadata: {
+                extractionMode: 'serialized-proof-only',
+                backendProofDecodeError:
+                    error instanceof Error ? error.message : String(error),
+            },
+        });
+    }
+
+    const proverProof = proofWithEvals[2];
+    const commitments = proverProof[1];
+    const openingProof = proverProof[2];
+    const prevChallenges = mlArrayItems(proverProof[6]);
+
+    return {
+        ...baseArtifact,
+        commitments: {
+            wComm: mlArrayItems(commitments[1]).map((polyComm) => polyCommToJson(polyComm)),
+            zComm: polyCommToJson(commitments[2]),
+            tComm: polyCommToJson(commitments[3]),
+        },
+        openingProof: {
+            lr: mlArrayItems(openingProof[1]).map((pair) => {
+                const openingPair = pair as any;
+                return {
+                    left: orInfinityToPoint(openingPair[1]),
+                    right: orInfinityToPoint(openingPair[2]),
+                };
+            }),
+            delta: orInfinityToPoint(openingProof[2]),
+            z1: openingProof[3],
+            z2: openingProof[4],
+            sg: orInfinityToPoint(openingProof[5]),
+        },
+        prevChallenges: prevChallenges.map((challenge) => {
+            const recursionChallenge = challenge as any;
+            return {
+                scalars: mlArrayItems(recursionChallenge[1]),
+                commitment: polyCommToJson(recursionChallenge[2]),
+            };
+        }),
+        metadata: {
+            extractionMode: 'backend-proof-evals',
+        },
+    };
+}
+
+async function findProofs(
+    value: unknown,
+    visited = new Set<unknown>(),
+    depth = 0
+): Promise<ProofLike[]> {
+    if (depth > 4 || !isObject(value) || visited.has(value)) {
+        return [];
+    }
+    visited.add(value);
+
+    if (isProofLike(value)) {
+        return [value];
+    }
+
+    const proofs: ProofLike[] = [];
+
+    if ('proofs' in value) {
+        const proofCollection =
+            typeof value.proofs === 'function'
+                ? await value.proofs()
+                : value.proofs;
+
+        if (Array.isArray(proofCollection)) {
+            for (const proof of proofCollection) {
+                if (isProofLike(proof)) {
+                    proofs.push(proof);
+                }
+            }
+        }
+    }
+
+    for (const nested of Object.values(value)) {
+        if (proofs.length > 0) break;
+        proofs.push(...(await findProofs(nested, visited, depth + 1)));
+    }
+
+    return proofs;
+}
+
 export async function captureKimchiCommitmentMsms<T>(
     run: () => Promise<T> | T,
     options: CaptureOptions = {}
-): Promise<{ result: T; datasets: KimchiMsmDataset[] }> {
-    const conversion = getRustConversion(wasm as any);
-    const datasets: KimchiMsmDataset[] = [];
-    const minDomainSize = options.minDomainSize ?? 1;
-    const maxDatasets = options.maxDatasets ?? Number.POSITIVE_INFINITY;
-    const sourceLabel = options.sourceLabel ?? 'kimchi-proving';
-    const basisCache = new Map<string, { x: bigint; y: bigint }[]>();
-    const originals = {
-        fp: wasm.caml_fp_srs_commit_evaluations as OriginalCommitEvaluationsFn,
-        fq: wasm.caml_fq_srs_commit_evaluations as OriginalCommitEvaluationsFn,
-    };
-    const counters = { fp: 0, fq: 0 };
+): Promise<{ result: T; artifacts: KimchiProofArtifact[] }> {
+    await bindingsModule.initializeBindings();
 
-    function installWrapper(field: FieldName) {
-        const original = originals[field];
-        const curve = FIELD_TO_CURVE[field];
-        const getBasis = field === 'fp'
-            ? wasm.caml_fp_srs_get_lagrange_basis
-            : wasm.caml_fq_srs_get_lagrange_basis;
-        const fieldConversion = field === 'fp' ? conversion.fp : conversion.fq;
+    const result = await run();
+    const sourceLabel = options.sourceLabel ?? 'kimchi-proof';
+    const proofs = await findProofs(result);
 
-        const wrapped: OriginalCommitEvaluationsFn = (srs, domainSize, evals) => {
-            if (domainSize >= minDomainSize && datasets.length < maxDatasets) {
-                const basisCacheKey = `${field}:${domainSize}`;
-                let points = basisCache.get(basisCacheKey);
+    if (proofs.length === 0) {
+        throw new Error(
+            'No o1js proofs were found in the proving module result. Return the proved transaction or an object that contains its proofs.'
+        );
+    }
 
-                if (!points) {
-                    const basisRust = getBasis(srs as any, domainSize);
-                    const basisPolyComms = mlArrayItems(
-                        fieldConversion.polyCommsFromRust(basisRust as any)
-                    );
-                    points = basisPolyComms.map(polyCommToAffinePoint);
-                    basisCache.set(basisCacheKey, points);
-                }
+    const artifacts = proofs.map((proof, index) =>
+        extractProofArtifacts(proof, `${sourceLabel}-proof-${index}`, sourceLabel)
+    );
 
-                const scalars = mlArrayItems(
-                    conversion.fieldsFromRustFlat(evals)
-                ).map((fieldElement: any) => fieldElement[1] as bigint);
-
-                if (scalars.length !== points.length) {
-                    throw new Error(
-                        `Captured commit_evaluations(${field}) with ${scalars.length} scalars and ${points.length} points`
-                    );
-                }
-
-                const index = counters[field]++;
-                datasets.push({
-                    version: 1,
-                    label: `${sourceLabel}-${field}-commit-evals-${index}`,
-                    source: sourceLabel,
-                    curve,
-                    msmKind: 'srs-commit-evaluations',
-                    domainSize,
-                    pointCount: points.length,
-                    scalars,
-                    points,
-                    metadata: {
-                        field,
-                        callIndex: index,
-                    },
-                });
-            }
-
-            return original(srs, domainSize, evals);
+    if (options.outFile) {
+        const artifactFile: KimchiProofArtifactFile = {
+            version: 1,
+            artifacts,
         };
-
-        if (field === 'fp') {
-            (wasm as any).caml_fp_srs_commit_evaluations = wrapped;
-        } else {
-            (wasm as any).caml_fq_srs_commit_evaluations = wrapped;
-        }
+        const outFile = path.resolve(options.outFile);
+        fs.mkdirSync(path.dirname(outFile), { recursive: true });
+        fs.writeFileSync(
+            outFile,
+            JSON.stringify(kimchiProofArtifactFileToJson(artifactFile), null, 2),
+            'utf8'
+        );
     }
 
-    installWrapper('fp');
-    installWrapper('fq');
-
-    try {
-        const result = await run();
-
-        if (options.outFile) {
-            const datasetFile: KimchiMsmDatasetFile = {
-                version: 1,
-                datasets,
-            };
-            const outFile = path.resolve(options.outFile);
-            fs.mkdirSync(path.dirname(outFile), { recursive: true });
-            fs.writeFileSync(
-                outFile,
-                JSON.stringify(kimchiMsmDatasetFileToJson(datasetFile), null, 2),
-                'utf8'
-            );
-        }
-
-        return { result, datasets };
-    } finally {
-        (wasm as any).caml_fp_srs_commit_evaluations = originals.fp;
-        (wasm as any).caml_fq_srs_commit_evaluations = originals.fq;
-    }
+    return { result, artifacts };
 }
 
 async function main() {
     const entryArg = process.argv[2];
-    const outFile = process.argv[3] ?? 'public/datasets/kimchi-commit-evals.json';
+    const outFile = process.argv[3] ?? 'public/datasets/kimchi-proof-artifacts.json';
 
     if (!entryArg) {
         throw new Error(
@@ -199,7 +281,7 @@ async function main() {
         );
     }
 
-    const { datasets } = await captureKimchiCommitmentMsms(
+    const { artifacts } = await captureKimchiCommitmentMsms(
         async () => await run(),
         {
             outFile,
@@ -208,7 +290,7 @@ async function main() {
     );
 
     console.log(
-        `Captured ${datasets.length} Kimchi commitment MSM datasets into ${path.resolve(outFile)}`
+        `Captured ${artifacts.length} Kimchi proof artifacts into ${path.resolve(outFile)}`
     );
 }
 
