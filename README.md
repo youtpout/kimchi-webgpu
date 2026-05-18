@@ -41,30 +41,30 @@ The benchmark uses valid Pallas curve points, verifies CPU/GPU equality on small
 
 ### Benchmark Commands
 
-- **Petit lot, comparaison CPU/GPU**:  
+- **Small batch, CPU/GPU comparison**:  
   `npm run bench:browser-cli -- '?sizes=128,1024&cpuMaxN=1024&rounds=3'`
 
-- **Lot moyen, comparaison CPU/GPU**:  
+- **Medium batch, CPU/GPU comparison**:  
   `npm run bench:browser-cli -- '?sizes=1024,4096,8192&cpuMaxN=8192&rounds=3'`
 
-- **Lot plus grand, comparaison CPU/GPU si la machine tient**:  
+- **Larger batch, CPU/GPU comparison if your machine can handle it**:  
   `npm run bench:browser-cli -- '?sizes=1024,4096,8192,16384&cpuMaxN=16384&rounds=3'`
 
-- **Gros lot, mesure GPU seule**:  
+- **Large batch, GPU-only measurement**:  
   `npm run bench:browser-cli -- '?sizes=32768,65536,131072&cpuMaxN=0&rounds=5'`
 
-- **Choisir une bucket width fixe**:  
+- **Use a fixed bucket width**:  
   `npm run bench:browser-cli -- '?sizes=4096,8192&cpuMaxN=8192&rounds=3&bucketWidthBits=10'`
 
-- **Mode interactif avec paramètres**:  
+- **Interactive mode with parameters**:  
   `npm run bench:browser -- '?sizes=1024,4096&cpuMaxN=4096&rounds=3'`
 
 ### Benchmark Query Params
 
-- `sizes`: liste des tailles MSM séparées par des virgules
-- `cpuMaxN`: taille maximale pour exécuter la référence CPU
-- `rounds`: nombre de runs GPU chauds mesurés
-- `bucketWidthBits`: force une bucket width fixe pour tous les cas
+- `sizes`: comma-separated list of MSM sizes
+- `cpuMaxN`: maximum size for running the CPU reference
+- `rounds`: number of measured warm GPU runs
+- `bucketWidthBits`: forces a fixed bucket width for all cases
 
 # Browser Proving Note
 
