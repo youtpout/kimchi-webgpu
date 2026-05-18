@@ -25,21 +25,20 @@ fn gte_256(a: array<u32, 8>, b: array<u32, 8>) -> bool {
 fn sub_no_borrow_256(a: array<u32, 8>, b: array<u32, 8>) -> array<u32, 8> {
     var result: array<u32, 8>;
     var borrow: u32 = 0u;
-    
+
     for (var i = 0u; i < 8u; i = i + 1u) {
         let ai = a[i];
         let bi = b[i];
-        
-        if (ai >= (bi + borrow)) {
-            result[i] = ai - bi - borrow;
-            borrow = 0u;
-        } else {
-            let temp = 0xFFFFFFFFu - bi - borrow + 1u;
-            result[i] = temp + ai;
-            borrow = 1u;
-        }
+        // Two-step subtraction avoids the bi+borrow u32 overflow when bi=0xFFFFFFFF
+        // and borrow=1 (which wraps to 0 and silently drops the carry).
+        let sub1 = ai - bi;
+        let borrow1 = u32(ai < bi);
+        let sub2 = sub1 - borrow;
+        let borrow2 = u32(sub1 < borrow);
+        result[i] = sub2;
+        borrow = borrow1 + borrow2; // always 0 or 1 (never 2)
     }
-    
+
     return result;
 }
 
@@ -269,14 +268,11 @@ fn to_projective_256(x: Limbs256, y: Limbs256, r2: array<u32, 8>, mont_inv32: u3
     return P;
 }
 
-// Convert projective point to affine coordinates
-// Inputs: P : ProjectivePoint256, r2, mont_inv32, p, p_minus_2
-// Output: Q : Point256 (x, y) in affine coordinates
-// Path:
-//   If z == 0, return (0,0)
-//   Compute z_inv = z^-1 mod p
-//   x_affine = x * z_inv, y_affine = y * z_inv
-//   Convert x_affine, y_affine from Montgomery form
+// Convert Jacobian projective point to affine coordinates.
+// The addition and doubling formulas use Jacobian coordinates where
+// affine = (X/Z², Y/Z³).
+// Inputs: P : ProjectivePoint256 in Jacobian form, r2, mont_inv32, p, p_minus_2
+// Output: Q : Point256 (x, y) in affine coordinates (standard form)
 fn to_affine_256(P: ProjectivePoint256, r2: array<u32, 8>, mont_inv32: u32, p: array<u32, 8>, p_minus_2: array<u32, 8>) -> Point256 {
     if (is_infinity_proj_256(P)) { // Note is_infinity_proj_256 returns are not constant time and so would be vulnerable to timing attacks FIXME
         var inf: Point256;
@@ -286,17 +282,20 @@ fn to_affine_256(P: ProjectivePoint256, r2: array<u32, 8>, mont_inv32: u32, p: a
         }
         return inf;
     }
-    
-    let z_inv = mod_inverse_mont_256(P.z.limbs, r2, mont_inv32, p, p_minus_2);
-    
+
+    // Jacobian: affine x = X / Z², affine y = Y / Z³
+    let z_inv  = mod_inverse_mont_256(P.z.limbs, r2, mont_inv32, p, p_minus_2);
+    let z_inv2 = mont_mul_256(z_inv, z_inv, mont_inv32, p);
+    let z_inv3 = mont_mul_256(z_inv2, z_inv, mont_inv32, p);
+
     var Q: Point256;
-    Q.x.limbs = mont_mul_256(P.x.limbs, z_inv, mont_inv32, p);
-    Q.y.limbs = mont_mul_256(P.y.limbs, z_inv, mont_inv32, p);
-    
+    Q.x.limbs = mont_mul_256(P.x.limbs, z_inv2, mont_inv32, p);
+    Q.y.limbs = mont_mul_256(P.y.limbs, z_inv3, mont_inv32, p);
+
     // Convert back from Montgomery form
     Q.x.limbs = from_montgomery_256(Q.x.limbs, mont_inv32, p);
     Q.y.limbs = from_montgomery_256(Q.y.limbs, mont_inv32, p);
-    
+
     return Q;
 }
 

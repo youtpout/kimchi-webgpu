@@ -541,7 +541,9 @@ ${importTypes}
 ${importArithmetic256}
 ${importPallas}
 
+// Group 0: constant parameters (BUCKET_WIDTH_BITS never changes, window_idx changes per window)
 @group(0) @binding(0) var<uniform> BUCKET_WIDTH_BITS: u32;
+@group(0) @binding(1) var<uniform> window_idx: u32;
 
 @group(1) @binding(0) var<uniform> bucket_idx: u32;
 
@@ -570,13 +572,14 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(workgroup_id) wg
     WGLx[local_idx] = IDENTITY_LIMBS_256;
     WGLy[local_idx] = IDENTITY_LIMBS_256;
     WGLz[local_idx] = IDENTITY_LIMBS_256;
-    
+
     workgroupBarrier();
 
     // Only process valid indices, but all threads participate in reduction
     if (idx < arrayLength(&k)) {
-        // Compute k_ij by extracting the bits corresponding to this bucket from k[idx]
-        let bit_offset = bucket_idx * BUCKET_WIDTH_BITS;
+        // Extract the scalar bits for this window (window_idx) — NOT bucket_idx.
+        // bucket_idx is the VALUE we are looking for within this window.
+        let bit_offset = window_idx * BUCKET_WIDTH_BITS;
         let limb_index = bit_offset / 32u;
         let bit_in_limb = bit_offset % 32u;
         let mask = (1u << BUCKET_WIDTH_BITS) - 1u;
@@ -633,7 +636,13 @@ ${importTypes}
 ${importArithmetic256}
 ${importPallas}
 
-@group(0) @binding(0) var<uniform> n: u32;
+// Group 0: reduction parameters — packed into one uniform struct to minimise bind-group slots.
+struct Bi2Uniforms {
+    n: u32,                 // WGG elements to reduce in this dispatch
+    window_idx: u32,        // which window we are processing
+    number_of_buckets: u32, // NUMBER_OF_BUCKETS = 1 << BUCKET_WIDTH_BITS
+}
+@group(0) @binding(0) var<uniform> bi2: Bi2Uniforms;
 
 @group(1) @binding(0) var<uniform> bucket_idx: u32;
 
@@ -645,9 +654,7 @@ ${importPallas}
 @group(3) @binding(1) var<storage, read_write> By: array<Limbs256>;
 @group(3) @binding(2) var<storage, read_write> Bz: array<Limbs256>;
 
-// 128 is an upper limit if we consider how much local memory there is 16,384 (16 KB)
-// We have 3, 8 limbs points so that 3 (points) * 8 (limbs) * 4 (bytes in a u32) * 128 (work group threads) = 12,288 (12.3KB)
-// This must be a power of 2 reduce the amount of bound checking we need.
+// 64 threads × 3 coordinates × 8 limbs × 4 bytes = 6,144 bytes — well within the 16 KB limit.
 const WORKGROUP_SIZE: u32 = 64u;
 
 var<workgroup> WGLx: array<Limbs256, WORKGROUP_SIZE>;
@@ -659,34 +666,35 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(local_invocation
     let idx = gid.x;
     let local_idx = lid.x;
     let workgroup_idx = wgid.x;
+    let n = bi2.n;
 
-    // Compute number of workgroups needed for current pass
-    let workgroups_needed = (n + WORKGROUP_SIZE - 1) / WORKGROUP_SIZE; // Ceil(n/WORKGROUP_SIZE)
-    // No threads needed beyond n
+    let workgroups_needed = (n + WORKGROUP_SIZE - 1u) / WORKGROUP_SIZE;
     if (workgroup_idx >= workgroups_needed) {
-        return; // We don't need these threads
+        return;
     }
-    // Load points into local memory, pad with zero points if out-of-bounds
+
+    // Load WGG into workgroup-local memory, padding out-of-bounds with identity.
     if (idx >= n) {
         WGLx[local_idx] = IDENTITY_LIMBS_256;
         WGLy[local_idx] = IDENTITY_LIMBS_256;
         WGLz[local_idx] = IDENTITY_LIMBS_256;
-    }
-    // Else we have a real point to load
-    else {
+    } else {
         WGLx[local_idx] = WGGx[idx];
         WGLy[local_idx] = WGGy[idx];
         WGLz[local_idx] = WGGz[idx];
     }
-    
-    // Workgroup-local binary reduction
-    var stride = WORKGROUP_SIZE / 2;
-    while (stride >= 1u) {
-        let half = stride >> 1u;
-        if (local_idx < half) {
+
+    workgroupBarrier(); // ensure all loads are visible before reduction starts
+
+    // Standard binary tree reduction: stride halves each step.
+    // FIX: was using "half = stride >> 1" as the partner offset which skipped the upper
+    // half of the workgroup entirely.  The correct partner is local_idx + stride.
+    var stride = WORKGROUP_SIZE / 2u;
+    while (stride > 0u) {
+        if (local_idx < stride) {
             let temp = point_add_proj_256(
                 ProjectivePoint256(WGLx[local_idx], WGLy[local_idx], WGLz[local_idx]),
-                ProjectivePoint256(WGLx[local_idx + half], WGLy[local_idx + half], WGLz[local_idx + half]),
+                ProjectivePoint256(WGLx[local_idx + stride], WGLy[local_idx + stride], WGLz[local_idx + stride]),
                 PALLAS_CURVE.r2,
                 PALLAS_CURVE.mont_inv32,
                 PALLAS_CURVE.p
@@ -696,21 +704,23 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(local_invocation
             WGLz[local_idx] = temp.z;
         }
         workgroupBarrier();
-        stride = half;
+        stride = stride / 2u;
     }
-    
-    // Local thread 0 writes the result to WGG post reduction
-    if (local_idx == 0) {
-        WGGx[workgroup_idx] = WGLx[local_idx];
-        WGGy[workgroup_idx] = WGLy[local_idx];
-        WGGz[workgroup_idx] = WGLz[local_idx];
+
+    // Thread 0 writes its workgroup's reduced result back to WGG.
+    if (local_idx == 0u) {
+        WGGx[workgroup_idx] = WGLx[0u];
+        WGGy[workgroup_idx] = WGLy[0u];
+        WGGz[workgroup_idx] = WGLz[0u];
     }
-    
-    // For the final pass, first global thread writes the fully reduced point to B_x,y,z
-    if (idx == 0 && n <= WORKGROUP_SIZE) {
-        Bx[bucket_idx] = WGGx[0];
-        By[bucket_idx] = WGGy[0];
-        Bz[bucket_idx] = WGGz[0];
+
+    // For the final pass (n fits in one workgroup), store the bucket result.
+    // FIX: index into B using the 2-D (window, bucket) layout instead of a flat bucket_idx.
+    if (idx == 0u && n <= WORKGROUP_SIZE) {
+        let b_idx = bi2.window_idx * bi2.number_of_buckets + bucket_idx;
+        Bx[b_idx] = WGGx[0u];
+        By[b_idx] = WGGy[0u];
+        Bz[b_idx] = WGGz[0u];
     }
 }
 `;
@@ -720,108 +730,92 @@ ${importTypes}
 ${importArithmetic256}
 ${importPallas}
 
-// Note that we might have multiple passes of different chunks of B_x,y,z if our point didnt fit into a single 4 million chunk
-@group(0) @binding(0) var<storage, read_write> Bx: array<Limbs256>;
-@group(0) @binding(1) var<storage, read_write> By: array<Limbs256>;
-@group(0) @binding(2) var<storage, read_write> Bz: array<Limbs256>;
+// Group 0: per-window uniform parameters.
+struct CUniforms {
+    window_idx: u32,        // which window's buckets to aggregate
+    number_of_buckets: u32, // NUMBER_OF_BUCKETS = 1 << BUCKET_WIDTH_BITS
+}
+@group(0) @binding(0) var<uniform> cu: CUniforms;
 
-@group(1) @binding(0) var<storage, read_write> Fx: array<Limbs256>;
-@group(1) @binding(1) var<storage, read_write> Fy: array<Limbs256>;
-@group(1) @binding(2) var<storage, read_write> Fz: array<Limbs256>;
+// B is now NUM_WINDOWS * NUMBER_OF_BUCKETS in size.
+// B[window_idx * number_of_buckets + v] = sum of P_i where window w of scalar k_i equals v.
+@group(1) @binding(0) var<storage, read_write> Bx: array<Limbs256>;
+@group(1) @binding(1) var<storage, read_write> By: array<Limbs256>;
+@group(1) @binding(2) var<storage, read_write> Bz: array<Limbs256>;
+
+// F receives partial weighted sums (one entry per workgroup).
+@group(2) @binding(0) var<storage, read_write> Fx: array<Limbs256>;
+@group(2) @binding(1) var<storage, read_write> Fy: array<Limbs256>;
+@group(2) @binding(2) var<storage, read_write> Fz: array<Limbs256>;
 
 const WORKGROUP_SIZE: u32 = 64u;
 var<workgroup> scaled: array<ProjectivePoint256, WORKGROUP_SIZE>;
 
 @compute @workgroup_size(WORKGROUP_SIZE)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>, @builtin(workgroup_id) wgid: vec3<u32>) {
-    let idx = gid.x;
+    let idx = gid.x;       // bucket value v within this window (0 .. number_of_buckets-1)
     let local_idx = lid.x;
     let workgroup_idx = wgid.x;
+    let NB = cu.number_of_buckets;
 
-    let NUM_BUCKETS = arrayLength(&Bx);
-
-    // Compute number of workgroups needed for current pass
-    let workgroups_needed = (NUM_BUCKETS + WORKGROUP_SIZE - 1) / WORKGROUP_SIZE; // Ceil(n/WORKGROUP_SIZE)
-    // No threads needed beyond NUM_BUCKETS
-    if (workgroup_idx >= workgroups_needed) { 
-        return; // We don't need these threads
-    }
-    // Load points into local memory, pad with zero points if out-of-bounds
-    if (idx >= NUM_BUCKETS) {
-        scaled[local_idx] = ProjectivePoint256(
-            IDENTITY_LIMBS_256,
-            IDENTITY_LIMBS_256,
-            IDENTITY_LIMBS_256
-        );
-    }
-    // Else we have a real point to load
-    else {
-        scaled[local_idx] = ProjectivePoint256(Bx[idx], By[idx], Bz[idx]);
+    let workgroups_needed = (NB + WORKGROUP_SIZE - 1u) / WORKGROUP_SIZE;
+    if (workgroup_idx >= workgroups_needed) {
+        return;
     }
 
-    // Next we need the same accumulation technique to weight the points in scaled but this is a bit confusing
-
-    // Step 1: Each thread scales its bucket by its weight
-    // B_x,y,z[idx] gets weight (NUM_BUCKETS - idx) to match Pippenger's algorithm
-    // This ensures: B[1] has highest weight, B[NUM_BUCKETS-1] has weight 1
-    
-    if (idx < NUM_BUCKETS) {
-        var weight = NUM_BUCKETS - idx;
+    // Step 1: Load B[window_idx * NB + idx] and apply Pippenger weight = idx (the bucket value).
+    // Bucket 0 contributes nothing (scalar bits = 0 means the point is not in this bucket window).
+    // FIX: weight = idx (the bucket value v), NOT NUM_BUCKETS - idx.
+    if (idx == 0u || idx >= NB) {
+        // Bucket 0 has weight 0; out-of-range threads hold identity.
+        scaled[local_idx] = ProjectivePoint256(IDENTITY_LIMBS_256, IDENTITY_LIMBS_256, IDENTITY_LIMBS_256);
+    } else {
+        let b_idx = cu.window_idx * NB + idx;
+        var weight = idx; // weight = bucket value v (1 .. NB-1)
         var accumulator = ProjectivePoint256(IDENTITY_LIMBS_256, IDENTITY_LIMBS_256, IDENTITY_LIMBS_256);
+        var temp = ProjectivePoint256(Bx[b_idx], By[b_idx], Bz[b_idx]);
 
-        var temp = scaled[local_idx];
-        
-        // Binary scalar multiplication: compute weight * B_x,y,z[local_idx]
-        // Process each bit of weight from LSB to MSB
+        // Binary scalar multiplication: weight * B[window_idx * NB + v]
         while (weight > 0u) {
-            // Could make this more efficient for weight 1 and 2, doing directly assignment or point double without needing to do the below.
             if ((weight & 1u) != 0u) {
                 accumulator = point_add_proj_256(
-                    accumulator,
-                    temp,
-                    PALLAS_CURVE.r2,
-                    PALLAS_CURVE.mont_inv32,
-                    PALLAS_CURVE.p
+                    accumulator, temp,
+                    PALLAS_CURVE.r2, PALLAS_CURVE.mont_inv32, PALLAS_CURVE.p
                 );
             }
             weight = weight >> 1u;
             if (weight > 0u) {
                 temp = point_double_proj_256(
                     temp,
-                    PALLAS_CURVE.r2,
-                    PALLAS_CURVE.mont_inv32,
-                    PALLAS_CURVE.p
+                    PALLAS_CURVE.r2, PALLAS_CURVE.mont_inv32, PALLAS_CURVE.p
                 );
             }
         }
-        
         scaled[local_idx] = accumulator;
     }
-    
+
     workgroupBarrier();
-    
-    // Step 2: Tree reduction to sum all scaled buckets
-    // Binary tree: stride goes 64 -> 32 -> 16 -> 8 -> 4 -> 2 -> 1
+
+    // Step 2: Tree reduction — sum all weighted bucket contributions within the workgroup.
     var stride = WORKGROUP_SIZE / 2u;
     while (stride > 0u) {
         if (local_idx < stride) {
             scaled[local_idx] = point_add_proj_256(
                 scaled[local_idx],
                 scaled[local_idx + stride],
-                PALLAS_CURVE.r2,
-                PALLAS_CURVE.mont_inv32,
-                PALLAS_CURVE.p
+                PALLAS_CURVE.r2, PALLAS_CURVE.mont_inv32, PALLAS_CURVE.p
             );
         }
         workgroupBarrier();
         stride = stride / 2u;
     }
-    
-    // Step 3: Thread 0 writes the point to F_x,y,z[workgroup_idx] which will be reduced in the final pass?
+
+    // Step 3: Thread 0 writes the partial weighted sum to F.
+    // Pass D will reduce F[0..ceil(NB/64)-1] into a single S_w for this window.
     if (local_idx == 0u) {
-        Fx[workgroup_idx] = scaled[0].x;
-        Fy[workgroup_idx] = scaled[0].y;
-        Fz[workgroup_idx] = scaled[0].z;
+        Fx[workgroup_idx] = scaled[0u].x;
+        Fy[workgroup_idx] = scaled[0u].y;
+        Fz[workgroup_idx] = scaled[0u].z;
     }
 }
 `;
@@ -995,6 +989,73 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(local_invocation
 }
 `;
 
+// -------------------------------------------------------------------------------------
+// Pass Horner — combine all per-window sums S_w using Horner's rule.
+//
+// After Pass C + Pass D have produced S_w = Σ_v v·B[w][v] for each window w,
+// this pass computes (sequentially, single thread):
+//
+//   result = S_{NUM_WINDOWS-1}
+//   for w = NUM_WINDOWS-2 down to 0:
+//     result = 2^BUCKET_WIDTH_BITS * result  (BUCKET_WIDTH_BITS doublings)
+//     result += S_w
+//
+// This implements  Σ_w 2^(w·BUCKET_WIDTH_BITS) · S_w  without any large-exponent
+// scalar multiplications.
+// -------------------------------------------------------------------------------------
+const pippengerShaderPassHorner = `
+${importTypes}
+${importArithmetic256}
+${importPallas}
+
+struct HornerUniforms {
+    num_windows: u32,
+    bucket_width_bits: u32,
+    batch_idx: u32,
+}
+@group(0) @binding(0) var<uniform> hu: HornerUniforms;
+
+// F_windows[w] = S_w, the weighted bucket sum for window w.
+@group(1) @binding(0) var<storage, read_write> fw_x: array<Limbs256>;
+@group(1) @binding(1) var<storage, read_write> fw_y: array<Limbs256>;
+@group(1) @binding(2) var<storage, read_write> fw_z: array<Limbs256>;
+
+// Output: batch_final_points[batch_idx] = Horner result (projective).
+@group(2) @binding(0) var<storage, read_write> batch_final_points_x: array<Limbs256>;
+@group(2) @binding(1) var<storage, read_write> batch_final_points_y: array<Limbs256>;
+@group(2) @binding(2) var<storage, read_write> batch_final_points_z: array<Limbs256>;
+
+@compute @workgroup_size(1)
+fn main() {
+    let NW = hu.num_windows;
+    let W  = hu.bucket_width_bits;
+
+    // Initialise with the highest window's sum.
+    var result = ProjectivePoint256(
+        fw_x[NW - 1u],
+        fw_y[NW - 1u],
+        fw_z[NW - 1u]
+    );
+
+    // Horner descent: result = 2^W * result + S_{w}  for w = NW-2 .. 0
+    var w: i32 = i32(NW) - 2;
+    while (w >= 0) {
+        // Multiply result by 2^W via W repeated doublings.
+        for (var d = 0u; d < W; d = d + 1u) {
+            result = point_double_proj_256(result, PALLAS_CURVE.r2, PALLAS_CURVE.mont_inv32, PALLAS_CURVE.p);
+        }
+        // Add S_w.
+        let sw = ProjectivePoint256(fw_x[u32(w)], fw_y[u32(w)], fw_z[u32(w)]);
+        result = point_add_proj_256(result, sw, PALLAS_CURVE.r2, PALLAS_CURVE.mont_inv32, PALLAS_CURVE.p);
+        w = w - 1;
+    }
+
+    batch_final_points_x[hu.batch_idx] = result.x;
+    batch_final_points_y[hu.batch_idx] = result.y;
+    batch_final_points_z[hu.batch_idx] = result.z;
+}
+`;
+
 export {
     pippengerShaderPassAProjectiveConversion,
     pippengerShaderPassBi1BucketScalarWeightedPointContribution,
@@ -1002,4 +1063,5 @@ export {
     pippengerShaderPassCBucketAggregation,
     pippengerShaderPassDTreeReduceFinalPoint,
     pippengerShaderPassEFinalAccumulation,
+    pippengerShaderPassHorner,
 };
