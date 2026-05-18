@@ -59,12 +59,71 @@ The benchmark uses valid Pallas curve points, verifies CPU/GPU equality on small
 - **Interactive mode with parameters**:  
   `npm run bench:browser -- '?sizes=1024,4096&cpuMaxN=4096&rounds=3'`
 
+- **Replay an exported Kimchi MSM dataset**:  
+  `npm run bench:browser-cli -- '?dataset=datasets/kimchi-commit-evals.json&rounds=3'`
+
 ### Benchmark Query Params
 
 - `sizes`: comma-separated list of MSM sizes
 - `cpuMaxN`: maximum size for running the CPU reference
 - `rounds`: number of measured warm GPU runs
 - `bucketWidthBits`: forces a fixed bucket width for all cases
+- `dataset`: path under `public/` to an exported Kimchi MSM dataset JSON file
+
+## Extract Real Kimchi MSM Datasets
+
+The repository includes a capture tool that instruments `o1js` during proving and dumps real SRS commitment MSM inputs.
+
+- **CLI entrypoint**:  
+  `npm run capture:kimchi-msm -- <proving-module> [out-file]`
+
+The proving module must export one of:
+
+- `default`
+- `run`
+- `main`
+- `prove`
+
+That exported function should run your normal `o1js` proving flow. While it runs, the capture tool intercepts real calls to:
+
+- `caml_fp_srs_commit_evaluations(...)`
+- `caml_fq_srs_commit_evaluations(...)`
+
+and writes them as replayable MSM datasets.
+
+### Example Capture Flow
+
+1. Create a proving module, for example `scripts/run-my-proof.js`, that generates a real Kimchi proof.
+2. Run:
+
+   `npm run capture:kimchi-msm -- ./scripts/run-my-proof.js public/datasets/kimchi-commit-evals.json`
+
+3. Replay the captured datasets in the browser:
+
+   `npm run bench:browser-cli -- '?dataset=datasets/kimchi-commit-evals.json&rounds=3'`
+
+### Important Note About Curves
+
+Real Kimchi prover MSMs can be on either Pasta curve.
+
+- `fp` SRS commitment datasets are exported as `curve: "vesta"`
+- `fq` SRS commitment datasets are exported as `curve: "pallas"`
+
+The current GPU replay path in this repository only supports `pallas`. So the capture path is ready for real prover extraction now, but replaying `vesta` datasets on the GPU will require a Vesta backend to be added.
+
+### Counter Example
+
+This repository includes a minimal proving entrypoint for the sample counter contract:
+
+- Proving module: [runCounterProof.ts](/home/eddy/Projects/kimchi-webgpu/src/proof/runCounterProof.ts)
+
+Capture MSM datasets from that proof flow with:
+
+`npm run capture:kimchi-msm -- ./dist/src/proof/runCounterProof.js public/datasets/counter-commit-evals.json`
+
+Replay the exported datasets with:
+
+`npm run bench:browser-cli -- '?dataset=datasets/counter-commit-evals.json&rounds=3'`
 
 # Browser Proving Note
 
