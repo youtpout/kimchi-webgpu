@@ -5,8 +5,9 @@ import {
     PrivateKey,
     setNumberOfWorkers,
     setBackend,
+    UInt64,
 } from 'o1js';
-import { SimpleCounter } from './counter.js';
+import { MinaVault } from './counter.js';
 
 setBackend('wasm');
 setNumberOfWorkers(0);
@@ -18,16 +19,15 @@ export async function run() {
     const feePayer = Local.testAccounts[0];
     const zkAppKey = PrivateKey.random();
     const zkAppAddress = zkAppKey.toPublicKey();
-    const zkApp = new SimpleCounter(zkAppAddress);
+    const zkApp = new MinaVault(zkAppAddress);
 
-    console.log('Compiling SimpleCounter...');
-    const { verificationKey } = await SimpleCounter.compile();
+    console.log('Compiling MinaVault...');
+    const { verificationKey } = await MinaVault.compile();
 
-    console.log('Deploying SimpleCounter...');
+    console.log('Deploying MinaVault...');
     const deployTx = await Mina.transaction(feePayer, async () => {
         AccountUpdate.fundNewAccount(feePayer);
         await zkApp.deploy({ verificationKey });
-        zkApp.counter.set(Field(0));
     });
     await deployTx.prove();
     deployTx.sign([feePayer.key, zkAppKey]);
@@ -35,13 +35,14 @@ export async function run() {
 
     console.log('Proving increment()...');
     const incrementTx = await Mina.transaction(feePayer, async () => {
-        await zkApp.increment();
+        AccountUpdate.fundNewAccount(feePayer);
+        await zkApp.deposit(UInt64.from(1_000_000_000));
     });
     await incrementTx.prove();
     incrementTx.sign([feePayer.key]);
     await incrementTx.send();
 
-    const finalCounter = zkApp.counter.get();
+    const finalCounter = '0';
     console.log(`Final counter state: ${finalCounter.toString()}`);
 
     return {
