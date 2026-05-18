@@ -1,9 +1,11 @@
 import {
     AccountUpdate,
     Field,
+    getGpuMsmRunner,
     getGpuProver,
     Mina,
     PrivateKey,
+    setGpuMsmRunner,
     setGpuProver,
     setNumberOfWorkers,
     setBackend,
@@ -33,8 +35,32 @@ function installGpuProofHook() {
     });
 }
 
+function installGpuMsmHook() {
+    if (getGpuMsmRunner() !== undefined) return;
+
+    setGpuMsmRunner(({ curve, msmKind, scalars, points, cpuFallback, metadata }) => {
+        const scalarCount = scalars?.length ?? 0;
+        const pointCount = points?.length ?? 0;
+        const domainSize =
+            typeof metadata === 'object' &&
+            metadata !== null &&
+            'domainSize' in metadata &&
+            typeof (metadata as { domainSize?: unknown }).domainSize === 'number'
+                ? (metadata as { domainSize: number }).domainSize
+                : undefined;
+
+        console.log(
+            `GPU MSM runner called: kind=${msmKind} curve=${curve} scalars=${scalarCount} points=${pointCount}` +
+                (domainSize === undefined ? '' : ` domainSize=${domainSize}`)
+        );
+
+        return cpuFallback?.();
+    });
+}
+
 export async function run() {
     installGpuProofHook();
+    installGpuMsmHook();
 
     const Local = await Mina.LocalBlockchain({ proofsEnabled: true });
     Mina.setActiveInstance(Local);

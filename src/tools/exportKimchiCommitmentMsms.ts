@@ -3,6 +3,7 @@ import path from 'path';
 import { createRequire } from 'module';
 import { fileURLToPath, pathToFileURL } from 'url';
 import { enrichKimchiProofArtifact } from '../datasets/kimchiProofArtifactReplay.js';
+import { summarizeKimchiProofArtifactFile } from '../datasets/kimchiProofArtifactReplay.js';
 import { kimchiProofArtifactFileToJson } from '../datasets/kimchiProofArtifacts.js';
 import type {
     KimchiProofArtifact,
@@ -292,6 +293,26 @@ async function main() {
     console.log(
         `Captured ${artifacts.length} Kimchi proof artifacts into ${path.resolve(outFile)}`
     );
+
+    const summaries = summarizeKimchiProofArtifactFile({
+        version: 1,
+        artifacts,
+    });
+    for (const summary of summaries) {
+        console.log(`Artifact: ${summary.label}`);
+        console.log(
+            `  curve=${summary.curve} extraction=${summary.extractionMode} replayablePoints=${summary.totalReplayPointCount}`
+        );
+        console.log(
+            `  commitments=${summary.commitmentPointCount} opening=${summary.openingPointCount} prevChallenges=${summary.prevChallengeCount}`
+        );
+        console.log(
+            `  invalidFieldPoints=${summary.invalidFieldPointCount} offCurvePoints=${summary.offCurvePointCount}`
+        );
+        if (summary.parserError) {
+            console.log(`  parserError=${summary.parserError}`);
+        }
+    }
 }
 
 const isMainModule =
