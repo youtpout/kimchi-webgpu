@@ -28,3 +28,9 @@
   `npm run test:browser`  
   This starts an Express server, opens Brave with WebGPU enabled, and displays test results in the browser page.  
   The page URL will be printed to stdout so you can open it manually if needed.
+
+# Browser Proving Note
+
+For repeated browser proofs, reuse the same WebGPU device and the same Pippenger MSM runner. The reusable entrypoint is `createPippengerMSMPallasRunner(device, { bucketWidthBits })` in `src/gpu/256bit/pallas/pippenger_msm.ts`.
+
+This avoids rebuilding shader modules, pipelines, bind groups, and large GPU buffers for every MSM invocation, which materially reduces host-side overhead during prover loops.

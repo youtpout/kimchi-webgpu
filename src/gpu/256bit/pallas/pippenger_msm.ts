@@ -8,7 +8,7 @@ import {
     pippengerShaderPassHorner as ShaderPassHorner,
 } from './pippenger_msm.wgslc.js';
 import {
-    bigint256ToLimbs,
+    writeBigint256ToLimbs,
     limbs256ToBigint,
     BYTES_PER_ELEMENT_256,
     LIMBS_PER_ELEMENT_256,
@@ -16,627 +16,876 @@ import {
 import { Point } from '../../../types/point.js';
 
 const WORKGROUP_SIZE_A = 64;
-const WORKGROUP_SIZE_Bi1 = 64;
-const WORKGROUP_SIZE_Bi2 = 64;
+const WORKGROUP_SIZE_BI1 = 64;
+const WORKGROUP_SIZE_BI2 = 64;
 const WORKGROUP_SIZE_C = 64;
 const WORKGROUP_SIZE_D = 64;
 const WORKGROUP_SIZE_E = 64;
-
 const SCALAR_BITS = 256;
+
+const runnerCache = new WeakMap<GPUDevice, Map<number, PippengerMSMPallasRunner>>();
 
 export interface PippengerMSMConfig {
     bucketWidthBits?: number;
     verbose?: boolean;
 }
 
+function normalizeBucketWidthBits(config?: PippengerMSMConfig): number {
+    const bucketWidthBits = config?.bucketWidthBits ?? 8;
+    if (bucketWidthBits < 1 || bucketWidthBits > 22) {
+        throw new Error('bucketWidthBits must be 1–22');
+    }
+    return bucketWidthBits;
+}
+
+export function createPippengerMSMPallasRunner(
+    device: GPUDevice,
+    config?: PippengerMSMConfig
+): PippengerMSMPallasRunner {
+    const bucketWidthBits = normalizeBucketWidthBits(config);
+    let runnersByBucketWidth = runnerCache.get(device);
+
+    if (!runnersByBucketWidth) {
+        runnersByBucketWidth = new Map();
+        runnerCache.set(device, runnersByBucketWidth);
+    }
+
+    let runner = runnersByBucketWidth.get(bucketWidthBits);
+    if (!runner) {
+        runner = new PippengerMSMPallasRunner(device, bucketWidthBits);
+        runnersByBucketWidth.set(bucketWidthBits, runner);
+    }
+
+    return runner;
+}
+
 export async function pippengerMSMPallas(
     device: GPUDevice,
     scalars: bigint[],
-    P: Point[],
+    points: Point[],
     config?: PippengerMSMConfig
 ): Promise<Point> {
-    const n = scalars.length;
-    if (n === 0) throw new Error('scalars and points arrays cannot be empty');
-    if (P.length !== n) throw new Error('scalars and points must have same length');
+    const runner = createPippengerMSMPallasRunner(device, config);
+    return runner.run(scalars, points, config);
+}
 
-    const BUCKET_WIDTH_BITS = config?.bucketWidthBits ?? 8;
-    if (BUCKET_WIDTH_BITS < 1 || BUCKET_WIDTH_BITS > 22)
-        throw new Error('bucketWidthBits must be 1–22');
+export class PippengerMSMPallasRunner {
+    readonly device: GPUDevice;
+    readonly bucketWidthBits: number;
+    readonly numberOfBuckets: number;
+    readonly numWindows: number;
+    readonly maxChunkN: number;
+    readonly maxNumWorkgroupsBi1: number;
+    readonly maxNumWorkgroupsC: number;
 
-    const NUMBER_OF_BUCKETS = 1 << BUCKET_WIDTH_BITS;
-    const NUM_WINDOWS = Math.ceil(SCALAR_BITS / BUCKET_WIDTH_BITS);
-    const verbose = config?.verbose ?? true;
+    private readonly kHost: Uint32Array;
+    private readonly pxHost: Uint32Array;
+    private readonly pyHost: Uint32Array;
 
-    const maxBufferSize = device.limits.maxStorageBufferBindingSize;
-    const MAX_WORKGROUPS = 65535;
-    const maxChunkN = Math.min(
-        Math.floor(maxBufferSize / BYTES_PER_ELEMENT_256),
-        MAX_WORKGROUPS * WORKGROUP_SIZE_Bi1
-    );
-    const numBatches = Math.ceil(n / maxChunkN);
+    private readonly layoutPassA: GPUBindGroupLayout;
+    private readonly layoutBi1Params: GPUBindGroupLayout;
+    private readonly layoutUniformSingle: GPUBindGroupLayout;
+    private readonly layoutWGG: GPUBindGroupLayout;
+    private readonly layoutBi2Uniforms: GPUBindGroupLayout;
+    private readonly layoutBucketsStorage: GPUBindGroupLayout;
+    private readonly layoutCUniforms: GPUBindGroupLayout;
+    private readonly layoutFStorage: GPUBindGroupLayout;
+    private readonly layoutUniformNBatchIdx: GPUBindGroupLayout;
+    private readonly layoutBatchFinalPoints: GPUBindGroupLayout;
+    private readonly layoutHornerUniforms: GPUBindGroupLayout;
+    private readonly layoutFinalPoint: GPUBindGroupLayout;
 
-    if (verbose) {
-        console.log('=== Pippenger MSM Configuration ===');
-        console.log(`Total points:         ${n}`);
-        console.log(`Bucket width (bits):  ${BUCKET_WIDTH_BITS}`);
-        console.log(`Number of buckets:    ${NUMBER_OF_BUCKETS}`);
-        console.log(`Number of windows:    ${NUM_WINDOWS}`);
-        console.log(`Max points per batch: ${maxChunkN}`);
-        console.log(`Number of batches:    ${numBatches}`);
-        console.log('===================================');
+    private readonly pipelineA: GPUComputePipeline;
+    private readonly pipelineBi1: GPUComputePipeline;
+    private readonly pipelineBi2: GPUComputePipeline;
+    private readonly pipelineC: GPUComputePipeline;
+    private readonly pipelineD: GPUComputePipeline;
+    private readonly pipelineE: GPUComputePipeline;
+    private readonly pipelineHorner: GPUComputePipeline;
+
+    private readonly bXBuffer: GPUBuffer;
+    private readonly bYBuffer: GPUBuffer;
+    private readonly bZBuffer: GPUBuffer;
+    private readonly fWindowsXBuffer: GPUBuffer;
+    private readonly fWindowsYBuffer: GPUBuffer;
+    private readonly fWindowsZBuffer: GPUBuffer;
+    private readonly finalPointXBuffer: GPUBuffer;
+    private readonly finalPointYBuffer: GPUBuffer;
+    private readonly finalPointXStagingBuffer: GPUBuffer;
+    private readonly finalPointYStagingBuffer: GPUBuffer;
+
+    private readonly bi1BucketWidthBitsBuffer: GPUBuffer;
+    private readonly bi1WindowIdxBuffer: GPUBuffer;
+    private readonly bucketIdxUniform: GPUBuffer;
+    private readonly bi2UniformsBuffer: GPUBuffer;
+    private readonly passANUniform: GPUBuffer;
+    private readonly cUniformsBuffer: GPUBuffer;
+    private readonly passDNUniform: GPUBuffer;
+    private readonly passDBatchIdxUniform: GPUBuffer;
+    private readonly passENUniform: GPUBuffer;
+    private readonly hornerUniformsBuffer: GPUBuffer;
+
+    private readonly kBuffer: GPUBuffer;
+    private readonly pxBuffer: GPUBuffer;
+    private readonly pyBuffer: GPUBuffer;
+    private readonly ppxBuffer: GPUBuffer;
+    private readonly ppyBuffer: GPUBuffer;
+    private readonly ppzBuffer: GPUBuffer;
+    private readonly wggXBuffer: GPUBuffer;
+    private readonly wggYBuffer: GPUBuffer;
+    private readonly wggZBuffer: GPUBuffer;
+    private readonly fXBuffer: GPUBuffer;
+    private readonly fYBuffer: GPUBuffer;
+    private readonly fZBuffer: GPUBuffer;
+
+    private readonly bindGroupPassA: GPUBindGroup;
+    private readonly bindGroupBi1Params: GPUBindGroup;
+    private readonly bindGroupBucketIdx: GPUBindGroup;
+    private readonly bindGroupPassBi1Input: GPUBindGroup;
+    private readonly bindGroupWGG: GPUBindGroup;
+    private readonly bindGroupBi2Uniforms: GPUBindGroup;
+    private readonly bindGroupBucketsStorage: GPUBindGroup;
+    private readonly bindGroupCUniforms: GPUBindGroup;
+    private readonly bindGroupFStorage: GPUBindGroup;
+    private readonly bindGroupPassDUniforms: GPUBindGroup;
+    private readonly bindGroupFWindowsOutput: GPUBindGroup;
+    private readonly bindGroupHornerUniforms: GPUBindGroup;
+    private readonly bindGroupFWindowsInput: GPUBindGroup;
+    private readonly bindGroupPassEN: GPUBindGroup;
+    private readonly bindGroupFinalPoint: GPUBindGroup;
+
+    private batchFinalPointsCapacity = 0;
+    private batchFinalPointsXBuffer!: GPUBuffer;
+    private batchFinalPointsYBuffer!: GPUBuffer;
+    private batchFinalPointsZBuffer!: GPUBuffer;
+    private bindGroupBatchFinalPoints!: GPUBindGroup;
+
+    constructor(device: GPUDevice, bucketWidthBits: number) {
+        this.device = device;
+        this.bucketWidthBits = bucketWidthBits;
+        this.numberOfBuckets = 1 << bucketWidthBits;
+        this.numWindows = Math.ceil(SCALAR_BITS / bucketWidthBits);
+
+        const maxBufferSize = device.limits.maxStorageBufferBindingSize;
+        const maxWorkgroups = 65535;
+        this.maxChunkN = Math.min(
+            Math.floor(maxBufferSize / BYTES_PER_ELEMENT_256),
+            maxWorkgroups * WORKGROUP_SIZE_BI1
+        );
+        this.maxNumWorkgroupsBi1 = Math.ceil(this.maxChunkN / WORKGROUP_SIZE_BI1);
+        this.maxNumWorkgroupsC = Math.ceil(this.numberOfBuckets / WORKGROUP_SIZE_C);
+
+        this.kHost = new Uint32Array(this.maxChunkN * LIMBS_PER_ELEMENT_256);
+        this.pxHost = new Uint32Array(this.maxChunkN * LIMBS_PER_ELEMENT_256);
+        this.pyHost = new Uint32Array(this.maxChunkN * LIMBS_PER_ELEMENT_256);
+
+        this.layoutPassA = device.createBindGroupLayout({
+            entries: [
+                { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
+                { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
+                { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
+                { binding: 3, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
+                { binding: 4, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
+                { binding: 5, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform' } },
+            ],
+        });
+
+        this.layoutBi1Params = device.createBindGroupLayout({
+            entries: [
+                { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform' } },
+                { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform' } },
+            ],
+        });
+
+        this.layoutUniformSingle = device.createBindGroupLayout({
+            entries: [{ binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform' } }],
+        });
+
+        const layoutPassBi1Input = device.createBindGroupLayout({
+            entries: [
+                { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
+                { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
+                { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
+                { binding: 3, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
+            ],
+        });
+
+        this.layoutWGG = device.createBindGroupLayout({
+            entries: [
+                { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
+                { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
+                { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
+            ],
+        });
+
+        this.layoutBi2Uniforms = device.createBindGroupLayout({
+            entries: [{ binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform' } }],
+        });
+
+        this.layoutBucketsStorage = device.createBindGroupLayout({
+            entries: [
+                { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
+                { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
+                { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
+            ],
+        });
+
+        this.layoutCUniforms = device.createBindGroupLayout({
+            entries: [{ binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform' } }],
+        });
+
+        this.layoutFStorage = device.createBindGroupLayout({
+            entries: [
+                { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
+                { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
+                { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
+            ],
+        });
+
+        this.layoutUniformNBatchIdx = device.createBindGroupLayout({
+            entries: [
+                { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform' } },
+                { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform' } },
+            ],
+        });
+
+        this.layoutBatchFinalPoints = device.createBindGroupLayout({
+            entries: [
+                { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
+                { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
+                { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
+            ],
+        });
+
+        this.layoutHornerUniforms = device.createBindGroupLayout({
+            entries: [{ binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform' } }],
+        });
+
+        this.layoutFinalPoint = device.createBindGroupLayout({
+            entries: [
+                { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
+                { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
+            ],
+        });
+
+        const shaderModules = {
+            A: device.createShaderModule({ code: ShaderPassA }),
+            Bi1: device.createShaderModule({ code: ShaderPassBi1 }),
+            Bi2: device.createShaderModule({ code: ShaderPassBi2 }),
+            C: device.createShaderModule({ code: ShaderPassC }),
+            D: device.createShaderModule({ code: ShaderPassD }),
+            E: device.createShaderModule({ code: ShaderPassE }),
+            Horner: device.createShaderModule({ code: ShaderPassHorner }),
+        };
+
+        this.pipelineA = device.createComputePipeline({
+            layout: device.createPipelineLayout({ bindGroupLayouts: [this.layoutPassA] }),
+            compute: { module: shaderModules.A, entryPoint: 'main' },
+        });
+
+        this.pipelineBi1 = device.createComputePipeline({
+            layout: device.createPipelineLayout({
+                bindGroupLayouts: [
+                    this.layoutBi1Params,
+                    this.layoutUniformSingle,
+                    layoutPassBi1Input,
+                    this.layoutWGG,
+                ],
+            }),
+            compute: { module: shaderModules.Bi1, entryPoint: 'main' },
+        });
+
+        this.pipelineBi2 = device.createComputePipeline({
+            layout: device.createPipelineLayout({
+                bindGroupLayouts: [
+                    this.layoutBi2Uniforms,
+                    this.layoutUniformSingle,
+                    this.layoutWGG,
+                    this.layoutBucketsStorage,
+                ],
+            }),
+            compute: { module: shaderModules.Bi2, entryPoint: 'main' },
+        });
+
+        this.pipelineC = device.createComputePipeline({
+            layout: device.createPipelineLayout({
+                bindGroupLayouts: [this.layoutCUniforms, this.layoutBucketsStorage, this.layoutFStorage],
+            }),
+            compute: { module: shaderModules.C, entryPoint: 'main' },
+        });
+
+        this.pipelineD = device.createComputePipeline({
+            layout: device.createPipelineLayout({
+                bindGroupLayouts: [
+                    this.layoutUniformNBatchIdx,
+                    this.layoutFStorage,
+                    this.layoutBatchFinalPoints,
+                ],
+            }),
+            compute: { module: shaderModules.D, entryPoint: 'main' },
+        });
+
+        this.pipelineE = device.createComputePipeline({
+            layout: device.createPipelineLayout({
+                bindGroupLayouts: [
+                    this.layoutUniformSingle,
+                    this.layoutBatchFinalPoints,
+                    this.layoutFinalPoint,
+                ],
+            }),
+            compute: { module: shaderModules.E, entryPoint: 'main' },
+        });
+
+        this.pipelineHorner = device.createComputePipeline({
+            layout: device.createPipelineLayout({
+                bindGroupLayouts: [
+                    this.layoutHornerUniforms,
+                    this.layoutFStorage,
+                    this.layoutBatchFinalPoints,
+                ],
+            }),
+            compute: { module: shaderModules.Horner, entryPoint: 'main' },
+        });
+
+        const bBufferSize = this.numWindows * this.numberOfBuckets * BYTES_PER_ELEMENT_256;
+        this.bXBuffer = this.createBuffer(bBufferSize, GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC);
+        this.bYBuffer = this.createBuffer(bBufferSize, GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC);
+        this.bZBuffer = this.createBuffer(bBufferSize, GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC);
+
+        this.fWindowsXBuffer = this.createBuffer(
+            this.numWindows * BYTES_PER_ELEMENT_256,
+            GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC
+        );
+        this.fWindowsYBuffer = this.createBuffer(
+            this.numWindows * BYTES_PER_ELEMENT_256,
+            GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC
+        );
+        this.fWindowsZBuffer = this.createBuffer(
+            this.numWindows * BYTES_PER_ELEMENT_256,
+            GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC
+        );
+
+        this.finalPointXBuffer = this.createBuffer(
+            BYTES_PER_ELEMENT_256,
+            GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC
+        );
+        this.finalPointYBuffer = this.createBuffer(
+            BYTES_PER_ELEMENT_256,
+            GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC
+        );
+        this.finalPointXStagingBuffer = this.createBuffer(
+            BYTES_PER_ELEMENT_256,
+            GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST
+        );
+        this.finalPointYStagingBuffer = this.createBuffer(
+            BYTES_PER_ELEMENT_256,
+            GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST
+        );
+
+        const u32Size = 4;
+        this.bi1BucketWidthBitsBuffer = this.createUniformBufferWithData([bucketWidthBits]);
+        this.bi1WindowIdxBuffer = this.createBuffer(u32Size, GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST);
+        this.bucketIdxUniform = this.createBuffer(u32Size, GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST);
+        this.bi2UniformsBuffer = this.createBuffer(16, GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST);
+        this.passANUniform = this.createBuffer(u32Size, GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST);
+        this.cUniformsBuffer = this.createBuffer(8, GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST);
+        this.passDNUniform = this.createBuffer(u32Size, GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST);
+        this.passDBatchIdxUniform = this.createBuffer(u32Size, GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST);
+        this.passENUniform = this.createBuffer(u32Size, GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST);
+        this.hornerUniformsBuffer = this.createBuffer(16, GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST);
+
+        const perBatchBufferSize = this.maxChunkN * BYTES_PER_ELEMENT_256;
+        this.kBuffer = this.createBuffer(perBatchBufferSize, GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST);
+        this.pxBuffer = this.createBuffer(perBatchBufferSize, GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST);
+        this.pyBuffer = this.createBuffer(perBatchBufferSize, GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST);
+        this.ppxBuffer = this.createBuffer(perBatchBufferSize, GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC);
+        this.ppyBuffer = this.createBuffer(perBatchBufferSize, GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC);
+        this.ppzBuffer = this.createBuffer(perBatchBufferSize, GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC);
+
+        const wggSizeMax = this.maxNumWorkgroupsBi1 * BYTES_PER_ELEMENT_256;
+        this.wggXBuffer = this.createBuffer(wggSizeMax, GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC);
+        this.wggYBuffer = this.createBuffer(wggSizeMax, GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC);
+        this.wggZBuffer = this.createBuffer(wggSizeMax, GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC);
+
+        const fBufferSizeMax = this.maxNumWorkgroupsC * BYTES_PER_ELEMENT_256;
+        this.fXBuffer = this.createBuffer(fBufferSizeMax, GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC);
+        this.fYBuffer = this.createBuffer(fBufferSizeMax, GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC);
+        this.fZBuffer = this.createBuffer(fBufferSizeMax, GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC);
+
+        this.bindGroupPassA = device.createBindGroup({
+            layout: this.layoutPassA,
+            entries: [
+                { binding: 0, resource: { buffer: this.pxBuffer } },
+                { binding: 1, resource: { buffer: this.pyBuffer } },
+                { binding: 2, resource: { buffer: this.ppxBuffer } },
+                { binding: 3, resource: { buffer: this.ppyBuffer } },
+                { binding: 4, resource: { buffer: this.ppzBuffer } },
+                { binding: 5, resource: { buffer: this.passANUniform } },
+            ],
+        });
+
+        this.bindGroupBi1Params = device.createBindGroup({
+            layout: this.layoutBi1Params,
+            entries: [
+                { binding: 0, resource: { buffer: this.bi1BucketWidthBitsBuffer } },
+                { binding: 1, resource: { buffer: this.bi1WindowIdxBuffer } },
+            ],
+        });
+
+        this.bindGroupBucketIdx = device.createBindGroup({
+            layout: this.layoutUniformSingle,
+            entries: [{ binding: 0, resource: { buffer: this.bucketIdxUniform } }],
+        });
+
+        this.bindGroupPassBi1Input = device.createBindGroup({
+            layout: layoutPassBi1Input,
+            entries: [
+                { binding: 0, resource: { buffer: this.kBuffer } },
+                { binding: 1, resource: { buffer: this.ppxBuffer } },
+                { binding: 2, resource: { buffer: this.ppyBuffer } },
+                { binding: 3, resource: { buffer: this.ppzBuffer } },
+            ],
+        });
+
+        this.bindGroupWGG = device.createBindGroup({
+            layout: this.layoutWGG,
+            entries: [
+                { binding: 0, resource: { buffer: this.wggXBuffer } },
+                { binding: 1, resource: { buffer: this.wggYBuffer } },
+                { binding: 2, resource: { buffer: this.wggZBuffer } },
+            ],
+        });
+
+        this.bindGroupBi2Uniforms = device.createBindGroup({
+            layout: this.layoutBi2Uniforms,
+            entries: [{ binding: 0, resource: { buffer: this.bi2UniformsBuffer } }],
+        });
+
+        this.bindGroupBucketsStorage = device.createBindGroup({
+            layout: this.layoutBucketsStorage,
+            entries: [
+                { binding: 0, resource: { buffer: this.bXBuffer } },
+                { binding: 1, resource: { buffer: this.bYBuffer } },
+                { binding: 2, resource: { buffer: this.bZBuffer } },
+            ],
+        });
+
+        this.bindGroupCUniforms = device.createBindGroup({
+            layout: this.layoutCUniforms,
+            entries: [{ binding: 0, resource: { buffer: this.cUniformsBuffer } }],
+        });
+
+        this.bindGroupFStorage = device.createBindGroup({
+            layout: this.layoutFStorage,
+            entries: [
+                { binding: 0, resource: { buffer: this.fXBuffer } },
+                { binding: 1, resource: { buffer: this.fYBuffer } },
+                { binding: 2, resource: { buffer: this.fZBuffer } },
+            ],
+        });
+
+        this.bindGroupPassDUniforms = device.createBindGroup({
+            layout: this.layoutUniformNBatchIdx,
+            entries: [
+                { binding: 0, resource: { buffer: this.passDNUniform } },
+                { binding: 1, resource: { buffer: this.passDBatchIdxUniform } },
+            ],
+        });
+
+        this.bindGroupFWindowsOutput = device.createBindGroup({
+            layout: this.layoutBatchFinalPoints,
+            entries: [
+                { binding: 0, resource: { buffer: this.fWindowsXBuffer } },
+                { binding: 1, resource: { buffer: this.fWindowsYBuffer } },
+                { binding: 2, resource: { buffer: this.fWindowsZBuffer } },
+            ],
+        });
+
+        this.bindGroupHornerUniforms = device.createBindGroup({
+            layout: this.layoutHornerUniforms,
+            entries: [{ binding: 0, resource: { buffer: this.hornerUniformsBuffer } }],
+        });
+
+        this.bindGroupFWindowsInput = device.createBindGroup({
+            layout: this.layoutFStorage,
+            entries: [
+                { binding: 0, resource: { buffer: this.fWindowsXBuffer } },
+                { binding: 1, resource: { buffer: this.fWindowsYBuffer } },
+                { binding: 2, resource: { buffer: this.fWindowsZBuffer } },
+            ],
+        });
+
+        this.bindGroupPassEN = device.createBindGroup({
+            layout: this.layoutUniformSingle,
+            entries: [{ binding: 0, resource: { buffer: this.passENUniform } }],
+        });
+
+        this.bindGroupFinalPoint = device.createBindGroup({
+            layout: this.layoutFinalPoint,
+            entries: [
+                { binding: 0, resource: { buffer: this.finalPointXBuffer } },
+                { binding: 1, resource: { buffer: this.finalPointYBuffer } },
+            ],
+        });
     }
 
-    let passCountA = 0, passCountBi1 = 0, passCountBi2 = 0;
-    let passCountC = 0, passCountD = 0, passCountHorner = 0, passCountE = 0;
-
-    // ---- Bind-group layouts ----
-
-    const layoutPassA = device.createBindGroupLayout({
-        entries: [
-            { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } }, // x
-            { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } }, // y
-            { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } }, // Px
-            { binding: 3, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } }, // Py
-            { binding: 4, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } }, // Pz
-            { binding: 5, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform' } }, // n
-        ],
-    });
-
-    // Bi_1 group 0: BUCKET_WIDTH_BITS (binding 0) + window_idx (binding 1)
-    const layoutBi1Params = device.createBindGroupLayout({
-        entries: [
-            { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform' } },
-            { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform' } },
-        ],
-    });
-
-    // Shared single-uniform layout (bucket_idx for Bi_1/Bi_2 group 1)
-    const layoutUniformSingle = device.createBindGroupLayout({
-        entries: [
-            { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform' } },
-        ],
-    });
-
-    const layoutPassBi1_Input = device.createBindGroupLayout({
-        entries: [
-            { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } }, // k
-            { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } }, // PPx
-            { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } }, // PPy
-            { binding: 3, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } }, // PPz
-        ],
-    });
-
-    const layoutWGG = device.createBindGroupLayout({
-        entries: [
-            { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
-            { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
-            { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
-        ],
-    });
-
-    // Bi_2 group 0: struct { n, window_idx, number_of_buckets }
-    const layoutBi2Uniforms = device.createBindGroupLayout({
-        entries: [
-            { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform' } },
-        ],
-    });
-
-    const layoutBucketsStorage = device.createBindGroupLayout({
-        entries: [
-            { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
-            { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
-            { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
-        ],
-    });
-
-    // Pass C group 0: struct { window_idx, number_of_buckets }
-    const layoutCUniforms = device.createBindGroupLayout({
-        entries: [
-            { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform' } },
-        ],
-    });
-
-    const layoutFStorage = device.createBindGroupLayout({
-        entries: [
-            { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
-            { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
-            { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
-        ],
-    });
-
-    const layoutUniformN_BatchIdx = device.createBindGroupLayout({
-        entries: [
-            { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform' } },
-            { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform' } },
-        ],
-    });
-
-    const layoutBatchFinalPoints = device.createBindGroupLayout({
-        entries: [
-            { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
-            { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
-            { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
-        ],
-    });
-
-    // Horner group 0: struct { num_windows, bucket_width_bits, batch_idx }
-    const layoutHornerUniforms = device.createBindGroupLayout({
-        entries: [
-            { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform' } },
-        ],
-    });
-
-    // Horner groups 1 and 2 reuse layoutFStorage / layoutBatchFinalPoints.
-
-    const layoutFinalPoint = device.createBindGroupLayout({
-        entries: [
-            { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
-            { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
-        ],
-    });
-
-    // ---- Shader modules & pipelines ----
-
-    const shaderModules = {
-        A: device.createShaderModule({ code: ShaderPassA }),
-        Bi1: device.createShaderModule({ code: ShaderPassBi1 }),
-        Bi2: device.createShaderModule({ code: ShaderPassBi2 }),
-        C: device.createShaderModule({ code: ShaderPassC }),
-        D: device.createShaderModule({ code: ShaderPassD }),
-        E: device.createShaderModule({ code: ShaderPassE }),
-        Horner: device.createShaderModule({ code: ShaderPassHorner }),
-    };
-
-    const pipelineA = device.createComputePipeline({
-        layout: device.createPipelineLayout({ bindGroupLayouts: [layoutPassA] }),
-        compute: { module: shaderModules.A, entryPoint: 'main' },
-    });
-
-    const pipelineBi1 = device.createComputePipeline({
-        layout: device.createPipelineLayout({
-            bindGroupLayouts: [layoutBi1Params, layoutUniformSingle, layoutPassBi1_Input, layoutWGG],
-        }),
-        compute: { module: shaderModules.Bi1, entryPoint: 'main' },
-    });
-
-    const pipelineBi2 = device.createComputePipeline({
-        layout: device.createPipelineLayout({
-            bindGroupLayouts: [layoutBi2Uniforms, layoutUniformSingle, layoutWGG, layoutBucketsStorage],
-        }),
-        compute: { module: shaderModules.Bi2, entryPoint: 'main' },
-    });
-
-    const pipelineC = device.createComputePipeline({
-        layout: device.createPipelineLayout({
-            bindGroupLayouts: [layoutCUniforms, layoutBucketsStorage, layoutFStorage],
-        }),
-        compute: { module: shaderModules.C, entryPoint: 'main' },
-    });
-
-    const pipelineD = device.createComputePipeline({
-        layout: device.createPipelineLayout({
-            bindGroupLayouts: [layoutUniformN_BatchIdx, layoutFStorage, layoutBatchFinalPoints],
-        }),
-        compute: { module: shaderModules.D, entryPoint: 'main' },
-    });
-
-    const pipelineE = device.createComputePipeline({
-        layout: device.createPipelineLayout({
-            bindGroupLayouts: [layoutUniformSingle, layoutBatchFinalPoints, layoutFinalPoint],
-        }),
-        compute: { module: shaderModules.E, entryPoint: 'main' },
-    });
-
-    const pipelineHorner = device.createComputePipeline({
-        layout: device.createPipelineLayout({
-            bindGroupLayouts: [layoutHornerUniforms, layoutFStorage, layoutBatchFinalPoints],
-        }),
-        compute: { module: shaderModules.Horner, entryPoint: 'main' },
-    });
-
-    // ---- Persistent GPU buffers ----
-
-    // B buffers: NUM_WINDOWS * NUMBER_OF_BUCKETS (flat 2-D: B[w * NB + v])
-    const bBufferSize = NUM_WINDOWS * NUMBER_OF_BUCKETS * BYTES_PER_ELEMENT_256;
-    const BxBuffer = device.createBuffer({ size: bBufferSize, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC });
-    const ByBuffer = device.createBuffer({ size: bBufferSize, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC });
-    const BzBuffer = device.createBuffer({ size: bBufferSize, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC });
-
-    // F_windows: one point per window (Pass D → F_windows[windowIdx])
-    const fWindowsXBuffer = device.createBuffer({ size: NUM_WINDOWS * BYTES_PER_ELEMENT_256, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC });
-    const fWindowsYBuffer = device.createBuffer({ size: NUM_WINDOWS * BYTES_PER_ELEMENT_256, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC });
-    const fWindowsZBuffer = device.createBuffer({ size: NUM_WINDOWS * BYTES_PER_ELEMENT_256, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC });
-
-    const batchFinalPointsSize = Math.max(numBatches * BYTES_PER_ELEMENT_256, BYTES_PER_ELEMENT_256);
-    const batchFinalPointsXBuffer = device.createBuffer({ size: batchFinalPointsSize, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC });
-    const batchFinalPointsYBuffer = device.createBuffer({ size: batchFinalPointsSize, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC });
-    const batchFinalPointsZBuffer = device.createBuffer({ size: batchFinalPointsSize, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC });
-
-    const finalPointXBuffer = device.createBuffer({ size: BYTES_PER_ELEMENT_256, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC });
-    const finalPointYBuffer = device.createBuffer({ size: BYTES_PER_ELEMENT_256, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC });
-
-    const finalPointXStagingBuffer = device.createBuffer({ size: BYTES_PER_ELEMENT_256, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
-    const finalPointYStagingBuffer = device.createBuffer({ size: BYTES_PER_ELEMENT_256, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
-
-    // ---- Uniform buffers (created once, updated via writeBuffer) ----
-
-    const u32Size = 4;
-
-    // Bi_1 group 0: BUCKET_WIDTH_BITS (constant) + window_idx (updated per window)
-    const bi1BucketWidthBitsBuffer = device.createBuffer({
-        size: u32Size, usage: GPUBufferUsage.UNIFORM, mappedAtCreation: true,
-    });
-    new Uint32Array(bi1BucketWidthBitsBuffer.getMappedRange()).set([BUCKET_WIDTH_BITS]);
-    bi1BucketWidthBitsBuffer.unmap();
-
-    const bi1WindowIdxBuffer = device.createBuffer({ size: u32Size, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
-
-    // Bi_1 / Bi_2 shared bucket_idx uniform (group 1)
-    const bucketIdxUniform = device.createBuffer({ size: u32Size, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
-
-    // Bi_2 group 0 struct: { n, window_idx, number_of_buckets } — 3 × u32, padded to 16 bytes
-    const bi2UniformsBuffer = device.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
-
-    // Pass A n uniform
-    const passA_N_Uniform = device.createBuffer({ size: u32Size, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
-
-    // Pass C group 0 struct: { window_idx, number_of_buckets } — padded to 8 bytes
-    const cUniformsBuffer = device.createBuffer({ size: 8, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
-
-    // Pass D uniforms (n, batchIdx)
-    const passD_N_Uniform = device.createBuffer({ size: u32Size, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
-    const passD_batchIdxUniform = device.createBuffer({ size: u32Size, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
-
-    // Pass E n uniform
-    const passE_N_Uniform = device.createBuffer({ size: u32Size, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
-
-    // Horner uniforms struct: { num_windows, bucket_width_bits, batch_idx } — padded to 16 bytes
-    const hornerUniformsBuffer = device.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
-
-    // ---- Per-batch reusable input/output GPU buffers ----
-
-    const perBatchBufferSize = maxChunkN * BYTES_PER_ELEMENT_256;
-    const kBuffer = device.createBuffer({ size: perBatchBufferSize, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
-    const PxBuffer = device.createBuffer({ size: perBatchBufferSize, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
-    const PyBuffer = device.createBuffer({ size: perBatchBufferSize, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
-    const PPxBuffer = device.createBuffer({ size: perBatchBufferSize, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC });
-    const PPyBuffer = device.createBuffer({ size: perBatchBufferSize, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC });
-    const PPzBuffer = device.createBuffer({ size: perBatchBufferSize, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC });
-
-    const maxNumWorkgroupsBi1 = Math.ceil(maxChunkN / WORKGROUP_SIZE_Bi1);
-    const wggSizeMax = maxNumWorkgroupsBi1 * BYTES_PER_ELEMENT_256;
-    const WGGxBuffer = device.createBuffer({ size: wggSizeMax, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC });
-    const WGGyBuffer = device.createBuffer({ size: wggSizeMax, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC });
-    const WGGzBuffer = device.createBuffer({ size: wggSizeMax, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC });
-
-    const maxNumWorkgroupsC = Math.ceil(NUMBER_OF_BUCKETS / WORKGROUP_SIZE_C);
-    const fBufferSizeMax = maxNumWorkgroupsC * BYTES_PER_ELEMENT_256;
-    const FxBuffer = device.createBuffer({ size: fBufferSizeMax, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC });
-    const FyBuffer = device.createBuffer({ size: fBufferSizeMax, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC });
-    const FzBuffer = device.createBuffer({ size: fBufferSizeMax, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC });
-
-    // ---- Bind groups (created once, reused across dispatches) ----
-
-    const bindGroupPassA = device.createBindGroup({
-        layout: layoutPassA,
-        entries: [
-            { binding: 0, resource: { buffer: PxBuffer } },
-            { binding: 1, resource: { buffer: PyBuffer } },
-            { binding: 2, resource: { buffer: PPxBuffer } },
-            { binding: 3, resource: { buffer: PPyBuffer } },
-            { binding: 4, resource: { buffer: PPzBuffer } },
-            { binding: 5, resource: { buffer: passA_N_Uniform } },
-        ],
-    });
-
-    const bindGroupBi1Params = device.createBindGroup({
-        layout: layoutBi1Params,
-        entries: [
-            { binding: 0, resource: { buffer: bi1BucketWidthBitsBuffer } },
-            { binding: 1, resource: { buffer: bi1WindowIdxBuffer } },
-        ],
-    });
-
-    const bindGroupBucketIdx = device.createBindGroup({
-        layout: layoutUniformSingle,
-        entries: [{ binding: 0, resource: { buffer: bucketIdxUniform } }],
-    });
-
-    const bindGroupPassBi1_Input = device.createBindGroup({
-        layout: pipelineBi1.getBindGroupLayout(2),
-        entries: [
-            { binding: 0, resource: { buffer: kBuffer } },
-            { binding: 1, resource: { buffer: PPxBuffer } },
-            { binding: 2, resource: { buffer: PPyBuffer } },
-            { binding: 3, resource: { buffer: PPzBuffer } },
-        ],
-    });
-
-    const bindGroupWGG = device.createBindGroup({
-        layout: layoutWGG,
-        entries: [
-            { binding: 0, resource: { buffer: WGGxBuffer } },
-            { binding: 1, resource: { buffer: WGGyBuffer } },
-            { binding: 2, resource: { buffer: WGGzBuffer } },
-        ],
-    });
-
-    const bindGroupBi2Uniforms = device.createBindGroup({
-        layout: layoutBi2Uniforms,
-        entries: [{ binding: 0, resource: { buffer: bi2UniformsBuffer } }],
-    });
-
-    const bindGroupBucketsStorage = device.createBindGroup({
-        layout: layoutBucketsStorage,
-        entries: [
-            { binding: 0, resource: { buffer: BxBuffer } },
-            { binding: 1, resource: { buffer: ByBuffer } },
-            { binding: 2, resource: { buffer: BzBuffer } },
-        ],
-    });
-
-    const bindGroupCUniforms = device.createBindGroup({
-        layout: layoutCUniforms,
-        entries: [{ binding: 0, resource: { buffer: cUniformsBuffer } }],
-    });
-
-    const bindGroupFStorage = device.createBindGroup({
-        layout: layoutFStorage,
-        entries: [
-            { binding: 0, resource: { buffer: FxBuffer } },
-            { binding: 1, resource: { buffer: FyBuffer } },
-            { binding: 2, resource: { buffer: FzBuffer } },
-        ],
-    });
-
-    const bindGroupPassD_Uniforms = device.createBindGroup({
-        layout: layoutUniformN_BatchIdx,
-        entries: [
-            { binding: 0, resource: { buffer: passD_N_Uniform } },
-            { binding: 1, resource: { buffer: passD_batchIdxUniform } },
-        ],
-    });
-
-    // Pass D writing to F_windows (for per-window reduction)
-    const bindGroupFWindowsOutput = device.createBindGroup({
-        layout: layoutBatchFinalPoints,
-        entries: [
-            { binding: 0, resource: { buffer: fWindowsXBuffer } },
-            { binding: 1, resource: { buffer: fWindowsYBuffer } },
-            { binding: 2, resource: { buffer: fWindowsZBuffer } },
-        ],
-    });
-
-    // Pass D writing to batch_final_points (for multi-batch Horner results after Pass E)
-    const bindGroupBatchFinalPoints = device.createBindGroup({
-        layout: layoutBatchFinalPoints,
-        entries: [
-            { binding: 0, resource: { buffer: batchFinalPointsXBuffer } },
-            { binding: 1, resource: { buffer: batchFinalPointsYBuffer } },
-            { binding: 2, resource: { buffer: batchFinalPointsZBuffer } },
-        ],
-    });
-
-    const bindGroupHornerUniforms = device.createBindGroup({
-        layout: layoutHornerUniforms,
-        entries: [{ binding: 0, resource: { buffer: hornerUniformsBuffer } }],
-    });
-
-    // Horner reads from F_windows
-    const bindGroupFWindowsInput = device.createBindGroup({
-        layout: layoutFStorage,
-        entries: [
-            { binding: 0, resource: { buffer: fWindowsXBuffer } },
-            { binding: 1, resource: { buffer: fWindowsYBuffer } },
-            { binding: 2, resource: { buffer: fWindowsZBuffer } },
-        ],
-    });
-
-    const bindGroupPassE_N = device.createBindGroup({
-        layout: layoutUniformSingle,
-        entries: [{ binding: 0, resource: { buffer: passE_N_Uniform } }],
-    });
-
-    const bindGroupFinalPoint = device.createBindGroup({
-        layout: layoutFinalPoint,
-        entries: [
-            { binding: 0, resource: { buffer: finalPointXBuffer } },
-            { binding: 1, resource: { buffer: finalPointYBuffer } },
-        ],
-    });
-
-    // ---- Main computation loop ----
-
-    let commandEncoder = device.createCommandEncoder();
-
-    for (let batchIdx = 0; batchIdx < numBatches; batchIdx++) {
-        const batchOffset = batchIdx * maxChunkN;
-        const currentBatchN = Math.min(n - batchOffset, maxChunkN);
-
-        if (verbose)
-            console.log(`Batch ${batchIdx + 1}/${numBatches} (${currentBatchN} points)`);
-
-        // Upload input data for this batch
-        const kArr = new Uint32Array(currentBatchN * LIMBS_PER_ELEMENT_256);
-        const PxArr = new Uint32Array(currentBatchN * LIMBS_PER_ELEMENT_256);
-        const PyArr = new Uint32Array(currentBatchN * LIMBS_PER_ELEMENT_256);
-        for (let i = 0; i < currentBatchN; i++) {
-            const g = batchOffset + i;
-            kArr.set(bigint256ToLimbs(scalars[g]), i * LIMBS_PER_ELEMENT_256);
-            PxArr.set(bigint256ToLimbs(P[g].x), i * LIMBS_PER_ELEMENT_256);
-            PyArr.set(bigint256ToLimbs(P[g].y), i * LIMBS_PER_ELEMENT_256);
-        }
-        device.queue.writeBuffer(kBuffer, 0, kArr);
-        device.queue.writeBuffer(PxBuffer, 0, PxArr);
-        device.queue.writeBuffer(PyBuffer, 0, PyArr);
-        device.queue.writeBuffer(passA_N_Uniform, 0, new Uint32Array([currentBatchN]));
-
-        // Pass A: affine → projective (Montgomery form)
-        {
-            const numWG = Math.ceil(currentBatchN / WORKGROUP_SIZE_A);
-            const pass = commandEncoder.beginComputePass();
-            pass.setPipeline(pipelineA);
-            pass.setBindGroup(0, bindGroupPassA);
-            pass.dispatchWorkgroups(numWG);
-            pass.end();
-            passCountA++;
+    async run(
+        scalars: bigint[],
+        points: Point[],
+        config?: PippengerMSMConfig
+    ): Promise<Point> {
+        const n = scalars.length;
+        if (n === 0) throw new Error('scalars and points arrays cannot be empty');
+        if (points.length !== n) throw new Error('scalars and points must have same length');
+
+        const verbose = config?.verbose ?? true;
+        const numBatches = Math.ceil(n / this.maxChunkN);
+        this.ensureBatchFinalPointsCapacity(numBatches);
+
+        if (verbose) {
+            console.log('=== Pippenger MSM Configuration ===');
+            console.log(`Total points:         ${n}`);
+            console.log(`Bucket width (bits):  ${this.bucketWidthBits}`);
+            console.log(`Number of buckets:    ${this.numberOfBuckets}`);
+            console.log(`Number of windows:    ${this.numWindows}`);
+            console.log(`Max points per batch: ${this.maxChunkN}`);
+            console.log(`Number of batches:    ${numBatches}`);
+            console.log('===================================');
         }
 
-        const numWorkgroupsBi1 = Math.ceil(currentBatchN / WORKGROUP_SIZE_Bi1);
+        let passCountA = 0;
+        let passCountBi1 = 0;
+        let passCountBi2 = 0;
+        let passCountC = 0;
+        let passCountD = 0;
+        let passCountHorner = 0;
+        let passCountE = 0;
 
-        // For each window, for each non-zero bucket value:
-        //   Pass Bi_1: gather points matching (window, bucketValue) into WGG
-        //   Pass Bi_2: reduce WGG → B[window * NB + bucketValue]
-        for (let windowIdx = 0; windowIdx < NUM_WINDOWS; windowIdx++) {
-            device.queue.writeBuffer(bi1WindowIdxBuffer, 0, new Uint32Array([windowIdx]));
+        let commandEncoder = this.device.createCommandEncoder();
+        this.clearReusableState(commandEncoder, numBatches);
+        this.device.queue.submit([commandEncoder.finish()]);
+        commandEncoder = this.device.createCommandEncoder();
 
-            for (let bucketValue = 1; bucketValue < NUMBER_OF_BUCKETS; bucketValue++) {
-                device.queue.writeBuffer(bucketIdxUniform, 0, new Uint32Array([bucketValue]));
+        for (let batchIdx = 0; batchIdx < numBatches; batchIdx++) {
+            const batchOffset = batchIdx * this.maxChunkN;
+            const currentBatchN = Math.min(n - batchOffset, this.maxChunkN);
 
-                // Pass Bi_1
-                {
-                    const pass = commandEncoder.beginComputePass();
-                    pass.setPipeline(pipelineBi1);
-                    pass.setBindGroup(0, bindGroupBi1Params);
-                    pass.setBindGroup(1, bindGroupBucketIdx);
-                    pass.setBindGroup(2, bindGroupPassBi1_Input);
-                    pass.setBindGroup(3, bindGroupWGG);
-                    pass.dispatchWorkgroups(numWorkgroupsBi1);
-                    pass.end();
-                    passCountBi1++;
-                }
-
-                // Pass Bi_2: tree-reduce WGG → B[windowIdx * NB + bucketValue]
-                let currentN_Bi2 = numWorkgroupsBi1;
-                while (currentN_Bi2 >= 1) {
-                    device.queue.writeBuffer(bi2UniformsBuffer, 0,
-                        new Uint32Array([currentN_Bi2, windowIdx, NUMBER_OF_BUCKETS, 0 /* padding */]));
-
-                    const numWG = Math.ceil(currentN_Bi2 / WORKGROUP_SIZE_Bi2);
-                    const pass = commandEncoder.beginComputePass();
-                    pass.setPipeline(pipelineBi2);
-                    pass.setBindGroup(0, bindGroupBi2Uniforms);
-                    pass.setBindGroup(1, bindGroupBucketIdx);
-                    pass.setBindGroup(2, bindGroupWGG);
-                    pass.setBindGroup(3, bindGroupBucketsStorage);
-                    pass.dispatchWorkgroups(numWG);
-                    pass.end();
-                    passCountBi2++;
-
-                    if (currentN_Bi2 <= WORKGROUP_SIZE_Bi2) break;
-                    currentN_Bi2 = Math.ceil(currentN_Bi2 / WORKGROUP_SIZE_Bi2);
-                }
-
-                // Submit after each (window, bucket) to guarantee ordering.
-                device.queue.submit([commandEncoder.finish()]);
-                commandEncoder = device.createCommandEncoder();
+            if (verbose) {
+                console.log(`Batch ${batchIdx + 1}/${numBatches} (${currentBatchN} points)`);
             }
 
-            // Pass C: weight each bucket v by its value v, partial tree-reduce → F
-            device.queue.writeBuffer(cUniformsBuffer, 0,
-                new Uint32Array([windowIdx, NUMBER_OF_BUCKETS]));
+            this.packBatchInputs(scalars, points, batchOffset, currentBatchN);
+            const usedHostLimbs = currentBatchN * LIMBS_PER_ELEMENT_256;
+
+            this.device.queue.writeBuffer(
+                this.kBuffer,
+                0,
+                this.kHost.buffer as ArrayBuffer,
+                0,
+                usedHostLimbs * Uint32Array.BYTES_PER_ELEMENT
+            );
+            this.device.queue.writeBuffer(
+                this.pxBuffer,
+                0,
+                this.pxHost.buffer as ArrayBuffer,
+                0,
+                usedHostLimbs * Uint32Array.BYTES_PER_ELEMENT
+            );
+            this.device.queue.writeBuffer(
+                this.pyBuffer,
+                0,
+                this.pyHost.buffer as ArrayBuffer,
+                0,
+                usedHostLimbs * Uint32Array.BYTES_PER_ELEMENT
+            );
+            this.device.queue.writeBuffer(this.passANUniform, 0, new Uint32Array([currentBatchN]));
 
             {
-                const numWG = Math.ceil(NUMBER_OF_BUCKETS / WORKGROUP_SIZE_C);
+                const numWG = Math.ceil(currentBatchN / WORKGROUP_SIZE_A);
                 const pass = commandEncoder.beginComputePass();
-                pass.setPipeline(pipelineC);
-                pass.setBindGroup(0, bindGroupCUniforms);
-                pass.setBindGroup(1, bindGroupBucketsStorage);
-                pass.setBindGroup(2, bindGroupFStorage);
+                pass.setPipeline(this.pipelineA);
+                pass.setBindGroup(0, this.bindGroupPassA);
                 pass.dispatchWorkgroups(numWG);
                 pass.end();
-                passCountC++;
+                passCountA++;
             }
 
-            // Pass D: reduce F → F_windows[windowIdx]
-            // Reuse Pass D shader with F_windows bound as the "batch_final_points" output.
-            let currentN_D = maxNumWorkgroupsC;
-            while (currentN_D >= 1) {
-                device.queue.writeBuffer(passD_N_Uniform, 0, new Uint32Array([currentN_D]));
-                device.queue.writeBuffer(passD_batchIdxUniform, 0, new Uint32Array([windowIdx]));
+            const numWorkgroupsBi1 = Math.ceil(currentBatchN / WORKGROUP_SIZE_BI1);
 
-                const numWG = Math.ceil(currentN_D / WORKGROUP_SIZE_D);
+            for (let windowIdx = 0; windowIdx < this.numWindows; windowIdx++) {
+                this.device.queue.writeBuffer(this.bi1WindowIdxBuffer, 0, new Uint32Array([windowIdx]));
+
+                for (let bucketValue = 1; bucketValue < this.numberOfBuckets; bucketValue++) {
+                    this.device.queue.writeBuffer(this.bucketIdxUniform, 0, new Uint32Array([bucketValue]));
+
+                    {
+                        const pass = commandEncoder.beginComputePass();
+                        pass.setPipeline(this.pipelineBi1);
+                        pass.setBindGroup(0, this.bindGroupBi1Params);
+                        pass.setBindGroup(1, this.bindGroupBucketIdx);
+                        pass.setBindGroup(2, this.bindGroupPassBi1Input);
+                        pass.setBindGroup(3, this.bindGroupWGG);
+                        pass.dispatchWorkgroups(numWorkgroupsBi1);
+                        pass.end();
+                        passCountBi1++;
+                    }
+
+                    let currentNBi2 = numWorkgroupsBi1;
+                    while (currentNBi2 >= 1) {
+                        this.device.queue.writeBuffer(
+                            this.bi2UniformsBuffer,
+                            0,
+                            new Uint32Array([currentNBi2, windowIdx, this.numberOfBuckets, 0])
+                        );
+
+                        const numWG = Math.ceil(currentNBi2 / WORKGROUP_SIZE_BI2);
+                        const pass = commandEncoder.beginComputePass();
+                        pass.setPipeline(this.pipelineBi2);
+                        pass.setBindGroup(0, this.bindGroupBi2Uniforms);
+                        pass.setBindGroup(1, this.bindGroupBucketIdx);
+                        pass.setBindGroup(2, this.bindGroupWGG);
+                        pass.setBindGroup(3, this.bindGroupBucketsStorage);
+                        pass.dispatchWorkgroups(numWG);
+                        pass.end();
+                        passCountBi2++;
+
+                        if (currentNBi2 <= WORKGROUP_SIZE_BI2) {
+                            break;
+                        }
+                        currentNBi2 = Math.ceil(currentNBi2 / WORKGROUP_SIZE_BI2);
+                    }
+
+                    this.device.queue.submit([commandEncoder.finish()]);
+                    commandEncoder = this.device.createCommandEncoder();
+                }
+
+                this.device.queue.writeBuffer(
+                    this.cUniformsBuffer,
+                    0,
+                    new Uint32Array([windowIdx, this.numberOfBuckets])
+                );
+
+                {
+                    const numWG = Math.ceil(this.numberOfBuckets / WORKGROUP_SIZE_C);
+                    const pass = commandEncoder.beginComputePass();
+                    pass.setPipeline(this.pipelineC);
+                    pass.setBindGroup(0, this.bindGroupCUniforms);
+                    pass.setBindGroup(1, this.bindGroupBucketsStorage);
+                    pass.setBindGroup(2, this.bindGroupFStorage);
+                    pass.dispatchWorkgroups(numWG);
+                    pass.end();
+                    passCountC++;
+                }
+
+                let currentND = this.maxNumWorkgroupsC;
+                while (currentND >= 1) {
+                    this.device.queue.writeBuffer(this.passDNUniform, 0, new Uint32Array([currentND]));
+                    this.device.queue.writeBuffer(
+                        this.passDBatchIdxUniform,
+                        0,
+                        new Uint32Array([windowIdx])
+                    );
+
+                    const numWG = Math.ceil(currentND / WORKGROUP_SIZE_D);
+                    const pass = commandEncoder.beginComputePass();
+                    pass.setPipeline(this.pipelineD);
+                    pass.setBindGroup(0, this.bindGroupPassDUniforms);
+                    pass.setBindGroup(1, this.bindGroupFStorage);
+                    pass.setBindGroup(2, this.bindGroupFWindowsOutput);
+                    pass.dispatchWorkgroups(numWG);
+                    pass.end();
+                    passCountD++;
+
+                    if (currentND <= WORKGROUP_SIZE_D) {
+                        break;
+                    }
+                    currentND = Math.ceil(currentND / WORKGROUP_SIZE_D);
+                }
+
+                this.device.queue.submit([commandEncoder.finish()]);
+                commandEncoder = this.device.createCommandEncoder();
+            }
+
+            this.device.queue.writeBuffer(
+                this.hornerUniformsBuffer,
+                0,
+                new Uint32Array([this.numWindows, this.bucketWidthBits, batchIdx, 0])
+            );
+
+            {
                 const pass = commandEncoder.beginComputePass();
-                pass.setPipeline(pipelineD);
-                pass.setBindGroup(0, bindGroupPassD_Uniforms);
-                pass.setBindGroup(1, bindGroupFStorage);
-                pass.setBindGroup(2, bindGroupFWindowsOutput); // writes to fWindows[windowIdx]
-                pass.dispatchWorkgroups(numWG);
+                pass.setPipeline(this.pipelineHorner);
+                pass.setBindGroup(0, this.bindGroupHornerUniforms);
+                pass.setBindGroup(1, this.bindGroupFWindowsInput);
+                pass.setBindGroup(2, this.bindGroupBatchFinalPoints);
+                pass.dispatchWorkgroups(1);
                 pass.end();
-                passCountD++;
-
-                if (currentN_D <= WORKGROUP_SIZE_D) break;
-                currentN_D = Math.ceil(currentN_D / WORKGROUP_SIZE_D);
+                passCountHorner++;
             }
 
-            device.queue.submit([commandEncoder.finish()]);
-            commandEncoder = device.createCommandEncoder();
+            this.device.queue.submit([commandEncoder.finish()]);
+            commandEncoder = this.device.createCommandEncoder();
         }
 
-        // Pass Horner: Horner-combine F_windows[0..NUM_WINDOWS-1] → batch_final_points[batchIdx]
-        device.queue.writeBuffer(hornerUniformsBuffer, 0,
-            new Uint32Array([NUM_WINDOWS, BUCKET_WIDTH_BITS, batchIdx, 0 /* padding */]));
+        let currentNE = numBatches;
+        while (currentNE >= 1) {
+            this.device.queue.writeBuffer(this.passENUniform, 0, new Uint32Array([currentNE]));
 
-        {
             const pass = commandEncoder.beginComputePass();
-            pass.setPipeline(pipelineHorner);
-            pass.setBindGroup(0, bindGroupHornerUniforms);
-            pass.setBindGroup(1, bindGroupFWindowsInput);
-            pass.setBindGroup(2, bindGroupBatchFinalPoints);
-            pass.dispatchWorkgroups(1);
+            pass.setPipeline(this.pipelineE);
+            pass.setBindGroup(0, this.bindGroupPassEN);
+            pass.setBindGroup(1, this.bindGroupBatchFinalPoints);
+            pass.setBindGroup(2, this.bindGroupFinalPoint);
+            pass.dispatchWorkgroups(Math.ceil(currentNE / WORKGROUP_SIZE_E));
             pass.end();
-            passCountHorner++;
+            passCountE++;
+
+            if (currentNE <= WORKGROUP_SIZE_E) {
+                break;
+            }
+            currentNE = Math.ceil(currentNE / WORKGROUP_SIZE_E);
         }
 
-        device.queue.submit([commandEncoder.finish()]);
-        commandEncoder = device.createCommandEncoder();
+        commandEncoder.copyBufferToBuffer(
+            this.finalPointXBuffer,
+            0,
+            this.finalPointXStagingBuffer,
+            0,
+            BYTES_PER_ELEMENT_256
+        );
+        commandEncoder.copyBufferToBuffer(
+            this.finalPointYBuffer,
+            0,
+            this.finalPointYStagingBuffer,
+            0,
+            BYTES_PER_ELEMENT_256
+        );
+
+        if (verbose) {
+            console.log('\n--- Dispatches per Stage ---');
+            console.log(`Pass A:      ${passCountA}`);
+            console.log(`Pass Bi1:    ${passCountBi1}`);
+            console.log(`Pass Bi2:    ${passCountBi2}`);
+            console.log(`Pass C:      ${passCountC}`);
+            console.log(`Pass D:      ${passCountD}`);
+            console.log(`Pass Horner: ${passCountHorner}`);
+            console.log(`Pass E:      ${passCountE}`);
+            console.log(
+                `TOTAL:       ${
+                    passCountA +
+                    passCountBi1 +
+                    passCountBi2 +
+                    passCountC +
+                    passCountD +
+                    passCountHorner +
+                    passCountE
+                }`
+            );
+            console.log('============================\n');
+        }
+
+        this.device.queue.submit([commandEncoder.finish()]);
+        await this.device.queue.onSubmittedWorkDone();
+
+        await this.finalPointXStagingBuffer.mapAsync(GPUMapMode.READ);
+        await this.finalPointYStagingBuffer.mapAsync(GPUMapMode.READ);
+
+        const xView = new Uint32Array(this.finalPointXStagingBuffer.getMappedRange()).slice();
+        const yView = new Uint32Array(this.finalPointYStagingBuffer.getMappedRange()).slice();
+
+        this.finalPointXStagingBuffer.unmap();
+        this.finalPointYStagingBuffer.unmap();
+
+        return { x: limbs256ToBigint(xView), y: limbs256ToBigint(yView) };
     }
 
-    // Pass E: accumulate all batch final points → final affine point
-    let currentN_E = numBatches;
-    while (currentN_E >= 1) {
-        device.queue.writeBuffer(passE_N_Uniform, 0, new Uint32Array([currentN_E]));
-
-        const pass = commandEncoder.beginComputePass();
-        pass.setPipeline(pipelineE);
-        pass.setBindGroup(0, bindGroupPassE_N);
-        pass.setBindGroup(1, bindGroupBatchFinalPoints);
-        pass.setBindGroup(2, bindGroupFinalPoint);
-        pass.dispatchWorkgroups(Math.ceil(currentN_E / WORKGROUP_SIZE_E));
-        pass.end();
-        passCountE++;
-
-        if (currentN_E <= WORKGROUP_SIZE_E) break;
-        currentN_E = Math.ceil(currentN_E / WORKGROUP_SIZE_E);
+    destroy(): void {
+        this.batchFinalPointsXBuffer?.destroy();
+        this.batchFinalPointsYBuffer?.destroy();
+        this.batchFinalPointsZBuffer?.destroy();
     }
 
-    commandEncoder.copyBufferToBuffer(finalPointXBuffer, 0, finalPointXStagingBuffer, 0, BYTES_PER_ELEMENT_256);
-    commandEncoder.copyBufferToBuffer(finalPointYBuffer, 0, finalPointYStagingBuffer, 0, BYTES_PER_ELEMENT_256);
-
-    if (verbose) {
-        console.log(`\n--- Dispatches per Stage ---`);
-        console.log(`Pass A:      ${passCountA}`);
-        console.log(`Pass Bi1:    ${passCountBi1}`);
-        console.log(`Pass Bi2:    ${passCountBi2}`);
-        console.log(`Pass C:      ${passCountC}`);
-        console.log(`Pass D:      ${passCountD}`);
-        console.log(`Pass Horner: ${passCountHorner}`);
-        console.log(`Pass E:      ${passCountE}`);
-        console.log(`TOTAL:       ${passCountA + passCountBi1 + passCountBi2 + passCountC + passCountD + passCountHorner + passCountE}`);
-        console.log('============================\n');
+    private packBatchInputs(
+        scalars: bigint[],
+        points: Point[],
+        batchOffset: number,
+        currentBatchN: number
+    ): void {
+        for (let i = 0; i < currentBatchN; i++) {
+            const sourceIndex = batchOffset + i;
+            const targetOffset = i * LIMBS_PER_ELEMENT_256;
+            writeBigint256ToLimbs(scalars[sourceIndex], this.kHost, targetOffset);
+            writeBigint256ToLimbs(points[sourceIndex].x, this.pxHost, targetOffset);
+            writeBigint256ToLimbs(points[sourceIndex].y, this.pyHost, targetOffset);
+        }
     }
 
-    device.queue.submit([commandEncoder.finish()]);
-    await device.queue.onSubmittedWorkDone();
+    private ensureBatchFinalPointsCapacity(numBatches: number): void {
+        if (numBatches <= this.batchFinalPointsCapacity) {
+            return;
+        }
 
-    await finalPointXStagingBuffer.mapAsync(GPUMapMode.READ);
-    await finalPointYStagingBuffer.mapAsync(GPUMapMode.READ);
+        this.batchFinalPointsXBuffer?.destroy();
+        this.batchFinalPointsYBuffer?.destroy();
+        this.batchFinalPointsZBuffer?.destroy();
 
-    const xView = new Uint32Array(finalPointXStagingBuffer.getMappedRange()).slice();
-    const yView = new Uint32Array(finalPointYStagingBuffer.getMappedRange()).slice();
+        const batchFinalPointsSize = Math.max(
+            numBatches * BYTES_PER_ELEMENT_256,
+            BYTES_PER_ELEMENT_256
+        );
 
-    finalPointXStagingBuffer.unmap();
-    finalPointYStagingBuffer.unmap();
+        this.batchFinalPointsXBuffer = this.createBuffer(
+            batchFinalPointsSize,
+            GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC
+        );
+        this.batchFinalPointsYBuffer = this.createBuffer(
+            batchFinalPointsSize,
+            GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC
+        );
+        this.batchFinalPointsZBuffer = this.createBuffer(
+            batchFinalPointsSize,
+            GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC
+        );
 
-    return { x: limbs256ToBigint(xView), y: limbs256ToBigint(yView) };
+        this.bindGroupBatchFinalPoints = this.device.createBindGroup({
+            layout: this.layoutBatchFinalPoints,
+            entries: [
+                { binding: 0, resource: { buffer: this.batchFinalPointsXBuffer } },
+                { binding: 1, resource: { buffer: this.batchFinalPointsYBuffer } },
+                { binding: 2, resource: { buffer: this.batchFinalPointsZBuffer } },
+            ],
+        });
+
+        this.batchFinalPointsCapacity = numBatches;
+    }
+
+    private clearReusableState(commandEncoder: GPUCommandEncoder, numBatches: number): void {
+        const batchBytes = Math.max(numBatches * BYTES_PER_ELEMENT_256, BYTES_PER_ELEMENT_256);
+        commandEncoder.clearBuffer(this.bXBuffer);
+        commandEncoder.clearBuffer(this.bYBuffer);
+        commandEncoder.clearBuffer(this.bZBuffer);
+        commandEncoder.clearBuffer(this.fWindowsXBuffer);
+        commandEncoder.clearBuffer(this.fWindowsYBuffer);
+        commandEncoder.clearBuffer(this.fWindowsZBuffer);
+        commandEncoder.clearBuffer(this.batchFinalPointsXBuffer, 0, batchBytes);
+        commandEncoder.clearBuffer(this.batchFinalPointsYBuffer, 0, batchBytes);
+        commandEncoder.clearBuffer(this.batchFinalPointsZBuffer, 0, batchBytes);
+        commandEncoder.clearBuffer(this.finalPointXBuffer);
+        commandEncoder.clearBuffer(this.finalPointYBuffer);
+    }
+
+    private createBuffer(size: number, usage: GPUBufferUsageFlags): GPUBuffer {
+        return this.device.createBuffer({ size, usage });
+    }
+
+    private createUniformBufferWithData(values: number[]): GPUBuffer {
+        const buffer = this.device.createBuffer({
+            size: values.length * 4,
+            usage: GPUBufferUsage.UNIFORM,
+            mappedAtCreation: true,
+        });
+        new Uint32Array(buffer.getMappedRange()).set(values);
+        buffer.unmap();
+        return buffer;
+    }
 }

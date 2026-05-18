@@ -1,12 +1,20 @@
 // Helper to convert bigint to 256-bit u32 array (little-endian, 8 limbs)
 export function bigint256ToLimbs(value: bigint): Uint32Array {
     const limbs = new Uint32Array(8);
+    writeBigint256ToLimbs(value, limbs);
+    return limbs;
+}
+
+export function writeBigint256ToLimbs(
+    value: bigint,
+    target: Uint32Array,
+    offset = 0
+): void {
     let v = value;
     for (let i = 0; i < 8; i++) {
-        limbs[i] = Number(v & 0xFFFFFFFFn);
+        target[offset + i] = Number(v & 0xFFFFFFFFn);
         v >>= 32n;
     }
-    return limbs;
 }
 
 // Helper to convert 256-bit u32 array back to bigint
