@@ -16,6 +16,16 @@ import { MinaVault } from './counter.js';
 setBackend('wasm');
 setNumberOfWorkers(0);
 
+function nowMs() {
+    return performance.now();
+}
+
+function logPhase(name: string, startMs: number) {
+    const elapsedMs = nowMs() - startMs;
+    console.log(`[o1js app-profile] phase=${name} elapsed_ms=${elapsedMs.toFixed(2)}`);
+    return nowMs();
+}
+
 function installGpuProofHook() {
     if (getGpuProver() !== undefined) return;
 
@@ -61,6 +71,7 @@ function installGpuMsmHook() {
 export async function run() {
     installGpuProofHook();
     installGpuMsmHook();
+    const totalStartMs = nowMs();
 
     const Local = await Mina.LocalBlockchain({ proofsEnabled: true });
     Mina.setActiveInstance(Local);
@@ -71,25 +82,34 @@ export async function run() {
     const zkApp = new MinaVault(zkAppAddress);
 
     console.log('Compiling MinaVault...');
+    let phaseStartMs = nowMs();
     const { verificationKey } = await MinaVault.compile();
+    phaseStartMs = logPhase('compile', phaseStartMs);
 
     console.log('Deploying MinaVault...');
     const deployTx = await Mina.transaction(feePayer, async () => {
         AccountUpdate.fundNewAccount(feePayer);
         await zkApp.deploy({ verificationKey });
     });
+    phaseStartMs = logPhase('deploy_tx_build', phaseStartMs);
     await deployTx.prove({ gpuProving: true });
+    phaseStartMs = logPhase('deploy_tx_prove', phaseStartMs);
     deployTx.sign([feePayer.key, zkAppKey]);
     await deployTx.send();
+    phaseStartMs = logPhase('deploy_tx_sign_send', phaseStartMs);
 
     console.log('Proving increment()...');
     const incrementTx = await Mina.transaction(feePayer, async () => {
         AccountUpdate.fundNewAccount(feePayer);
         await zkApp.deposit(UInt64.from(1_000_000_000));
     });
+    phaseStartMs = logPhase('increment_tx_build', phaseStartMs);
     await incrementTx.prove({ gpuProving: true });
+    phaseStartMs = logPhase('increment_tx_prove', phaseStartMs);
     incrementTx.sign([feePayer.key]);
     await incrementTx.send();
+    phaseStartMs = logPhase('increment_tx_sign_send', phaseStartMs);
+    logPhase('run_total', totalStartMs);
 
     const finalCounter = '0';
     console.log(`Final counter state: ${finalCounter.toString()}`);

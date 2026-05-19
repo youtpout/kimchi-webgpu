@@ -4,7 +4,6 @@ import { createRequire } from 'module';
 import { pathToFileURL } from 'url';
 import {
     kimchiMsmDatasetFileFromJson,
-    type KimchiCurveName,
     type KimchiMsmDataset,
 } from '../datasets/kimchiMsmDataset.js';
 
@@ -16,6 +15,7 @@ interface Args {
     rounds: number;
     cpuMaxN: number;
     limit?: number;
+    outFile?: string;
 }
 
 interface CpuBenchmarkResult {
@@ -26,11 +26,25 @@ interface CpuBenchmarkResult {
     result: { x: bigint; y: bigint };
 }
 
+interface CpuBenchmarkFileJson {
+    version: 1;
+    results: {
+        label: string;
+        curve: KimchiMsmDataset['curve'];
+        msmKind: KimchiMsmDataset['msmKind'];
+        pointCount: number;
+        coldMs: number;
+        warmTimingsMs: number[];
+        medianWarmMs: number;
+        result: { x: string; y: string };
+    }[];
+}
+
 function parseArgs(argv: string[]): Args {
     const datasetFile = argv[2];
     if (!datasetFile) {
         throw new Error(
-            'Usage: node dist/src/tools/benchmarkKimchiCpuMsms.js <dataset-file> [--backend=wasm|native] [--rounds=N] [--cpuMaxN=N] [--limit=N]'
+            'Usage: node dist/src/tools/benchmarkKimchiCpuMsms.js <dataset-file> [--backend=wasm|native] [--rounds=N] [--cpuMaxN=N] [--limit=N] [--out=FILE]'
         );
     }
 
@@ -38,6 +52,7 @@ function parseArgs(argv: string[]): Args {
     let rounds = 3;
     let cpuMaxN = Number.POSITIVE_INFINITY;
     let limit: number | undefined;
+    let outFile: string | undefined;
 
     for (const arg of argv.slice(3)) {
         if (arg.startsWith('--backend=')) {
@@ -52,10 +67,12 @@ function parseArgs(argv: string[]): Args {
             cpuMaxN = Number.parseInt(arg.slice('--cpuMaxN='.length), 10);
         } else if (arg.startsWith('--limit=')) {
             limit = Number.parseInt(arg.slice('--limit='.length), 10);
+        } else if (arg.startsWith('--out=')) {
+            outFile = arg.slice('--out='.length);
         }
     }
 
-    return { datasetFile, backend, rounds, cpuMaxN, limit };
+    return { datasetFile, backend, rounds, cpuMaxN, limit, outFile };
 }
 
 function median(values: number[]): number {
@@ -76,76 +93,58 @@ function mlFields(fields: bigint[]) {
     return [0, ...fields.map((field) => [0, field])] as [0, ...[0, bigint][]];
 }
 
-function polyCommToPoint(polyComm: any): { x: bigint; y: bigint } {
-    const unshifted = polyComm[1];
-    const firstPoint = unshifted[1];
-    if (firstPoint === 0) {
+function mlPoints(points: { x: bigint; y: bigint }[]) {
+    return [
+        0,
+        ...points.map((point) => [0, [0, [0, point.x], [0, point.y]]]),
+    ] as [0, ...[0, [0, [0, bigint], [0, bigint]]][]];
+}
+
+function orInfinityToPoint(point: any): { x: bigint; y: bigint } {
+    if (point === 0) {
         return { x: 0n, y: 0n };
     }
     return {
-        x: firstPoint[1][1][1],
-        y: firstPoint[1][2][1],
+        x: point[1][1][1],
+        y: point[1][2][1],
     };
 }
 
 function createDatasetRunner(
     dataset: KimchiMsmDataset,
     deps: {
-        bindingsModule: any;
         conversion: any;
         kimchiWasm: any;
     }
 ): () => { x: bigint; y: bigint } {
-    const { bindingsModule, conversion, kimchiWasm } = deps;
+    const { conversion, kimchiWasm } = deps;
     const field = dataset.curve === 'pallas' ? 'fq' : 'fp';
-    const domainSize = dataset.domainSize ?? dataset.pointCount;
-    if ((domainSize & (domainSize - 1)) !== 0) {
-        throw new Error(
-            `Expected a power-of-two domain size, received ${domainSize} for ${dataset.label}`
-        );
-    }
-    const log2Size = Math.round(Math.log2(domainSize));
-    const srs =
-        field === 'fq'
-            ? bindingsModule.Pickles.loadSrsFq()
-            : bindingsModule.Pickles.loadSrsFp();
-    if (field === 'fq') {
-        kimchiWasm.caml_fq_srs_add_lagrange_basis(srs, log2Size);
-    } else {
-        kimchiWasm.caml_fp_srs_add_lagrange_basis(srs, log2Size);
-    }
     const rustScalars =
         field === 'fq'
             ? conversion.fq.vectorToRust(mlFields(dataset.scalars))
             : conversion.fp.vectorToRust(mlFields(dataset.scalars));
+    const datasetPoints = mlPoints(dataset.points);
 
     return () => {
-        const rustPolyComm =
+        const rustPoints =
             field === 'fq'
-                ? kimchiWasm.caml_fq_srs_commit_evaluations(
-                      srs,
-                      domainSize,
-                      rustScalars
-                  )
-                : kimchiWasm.caml_fp_srs_commit_evaluations(
-                      srs,
-                      domainSize,
-                      rustScalars
-                  );
-
-        const polyComm =
+                ? conversion.fq.pointsToRust(datasetPoints)
+                : conversion.fp.pointsToRust(datasetPoints);
+        const rustPoint =
             field === 'fq'
-                ? conversion.fq.polyCommFromRust(rustPolyComm)
-                : conversion.fp.polyCommFromRust(rustPolyComm);
-
-        return polyCommToPoint(polyComm);
+                ? kimchiWasm.caml_pallas_msm(rustPoints, rustScalars)
+                : kimchiWasm.caml_vesta_msm(rustPoints, rustScalars);
+        const point =
+            field === 'fq'
+                ? conversion.fq.pointFromRust(rustPoint)
+                : conversion.fp.pointFromRust(rustPoint);
+        return orInfinityToPoint(point);
     };
 }
 
 async function benchmarkDataset(
     dataset: KimchiMsmDataset,
     deps: {
-        bindingsModule: any;
         conversion: any;
         kimchiWasm: any;
     },
@@ -195,10 +194,6 @@ async function main() {
     )) as {
         initializeBindings: () => Promise<void>;
         wasm: any;
-        Pickles: {
-            loadSrsFp: () => unknown;
-            loadSrsFq: () => unknown;
-        };
     };
     const { getRustConversion } = (await import(
         pathToFileURL(
@@ -235,7 +230,6 @@ async function main() {
         console.log(`Point count: ${dataset.pointCount}`);
 
         const result = await benchmarkDataset(dataset, {
-            bindingsModule,
             conversion,
             kimchiWasm,
         }, args.rounds);
@@ -270,6 +264,29 @@ async function main() {
                 2
             )} median_warm_ms=${medianOfMedians.toFixed(2)}`
         );
+    }
+
+    if (args.outFile) {
+        const outPath = path.resolve(args.outFile);
+        const output: CpuBenchmarkFileJson = {
+            version: 1,
+            results: results.map((entry) => ({
+                label: entry.dataset.label,
+                curve: entry.dataset.curve,
+                msmKind: entry.dataset.msmKind,
+                pointCount: entry.dataset.pointCount,
+                coldMs: entry.coldMs,
+                warmTimingsMs: entry.warmTimingsMs,
+                medianWarmMs: entry.medianWarmMs,
+                result: {
+                    x: entry.result.x.toString(),
+                    y: entry.result.y.toString(),
+                },
+            })),
+        };
+        fs.mkdirSync(path.dirname(outPath), { recursive: true });
+        fs.writeFileSync(outPath, JSON.stringify(output, null, 2), 'utf8');
+        console.log(`CPU results written to ${outPath}`);
     }
 }
 

@@ -25,6 +25,20 @@ interface CpuPoint {
     isInfinity: boolean;
 }
 
+interface CpuBenchmarkResultFile {
+    version: 1;
+    results: {
+        label: string;
+        curve: 'pallas' | 'vesta';
+        msmKind: string;
+        pointCount: number;
+        coldMs: number;
+        warmTimingsMs: number[];
+        medianWarmMs: number;
+        result: { x: string; y: string };
+    }[];
+}
+
 const CPU_INFINITY: CpuPoint = { x: 0n, y: 0n, isInfinity: true };
 
 async function getDevice(): Promise<GPUDevice> {
@@ -45,6 +59,18 @@ async function fetchDatasetFile() {
     }
 
     return kimchiMsmDatasetFileFromJson(await response.json());
+}
+
+async function fetchCpuBenchmarkFile() {
+    const params = new URLSearchParams(window.location.search);
+    const cpuResultsPath = params.get('cpuResults');
+    if (!cpuResultsPath) return null;
+
+    const response = await fetch(`/${cpuResultsPath}`);
+    if (!response.ok) {
+        throw new Error(`Failed to fetch CPU benchmark file: ${cpuResultsPath}`);
+    }
+    return (await response.json()) as CpuBenchmarkResultFile;
 }
 
 function median(values: number[]): number {
@@ -230,6 +256,10 @@ if (requestedDataset) {
                 const cpuMaxN = cpuMaxNParam
                     ? Number.parseInt(cpuMaxNParam, 10)
                     : 4096;
+                const cpuBenchmarkFile = await fetchCpuBenchmarkFile();
+                const cpuBenchmarks = new Map(
+                    (cpuBenchmarkFile?.results ?? []).map((entry) => [entry.label, entry])
+                );
                 const device = await getDevice();
 
                 for (const dataset of datasetFile.datasets) {
@@ -246,8 +276,20 @@ if (requestedDataset) {
                     );
 
                     let cpuMs: number | null = null;
+                    let cpuColdMs: number | null = null;
                     let cpuResult: CpuPoint | null = null;
-                    if (dataset.pointCount <= cpuMaxN) {
+                    const cpuBenchmark = cpuBenchmarks.get(dataset.label);
+                    if (cpuBenchmark) {
+                        cpuColdMs = cpuBenchmark.coldMs;
+                        cpuMs = cpuBenchmark.medianWarmMs;
+                        cpuResult = {
+                            x: BigInt(cpuBenchmark.result.x),
+                            y: BigInt(cpuBenchmark.result.y),
+                            isInfinity: false,
+                        };
+                        console.log(`CPU wasm cold run: ${cpuColdMs.toFixed(2)} ms`);
+                        console.log(`CPU wasm median warm run: ${cpuMs.toFixed(2)} ms`);
+                    } else if (dataset.pointCount <= cpuMaxN) {
                         const cpuStart = performance.now();
                         cpuResult = cpuMSM(
                             dataset.scalars,
@@ -255,6 +297,7 @@ if (requestedDataset) {
                             dataset.curve
                         );
                         cpuMs = performance.now() - cpuStart;
+                        cpuColdMs = cpuMs;
                         console.log(`CPU reference: ${cpuMs.toFixed(2)} ms`);
                     } else {
                         console.log('CPU reference skipped for this dataset');
@@ -311,9 +354,11 @@ if (requestedDataset) {
                                 : `${dataset.label} CPU/GPU mismatch: ${mismatch}`
                         ).to.equal(null);
                         console.log('Correctness: CPU/GPU match');
-                        console.log(
-                            `Speedup CPU/GPU cold: ${(cpuMs / coldMs).toFixed(2)}x`
-                        );
+                        if (cpuColdMs !== null) {
+                            console.log(
+                                `Speedup CPU/GPU cold: ${(cpuColdMs / coldMs).toFixed(2)}x`
+                            );
+                        }
                         console.log(
                             `Speedup CPU/GPU warm median: ${(cpuMs / medianMs).toFixed(2)}x`
                         );

@@ -137,16 +137,32 @@ The proof-artifact flow above extracts points from the final proof. If you want 
 - **Capture witness-column commitment MSMs from `proof_create()`**:  
   `npm run capture:kimchi-internal-msm -- ./dist/src/proof/runCounterProof.js public/datasets/kimchi-internal-msm.json`
 
-This mode hooks the low-level Kimchi `proof_create()` entrypoints and reconstructs witness-column commitment MSM inputs from:
-
-- the real witness columns passed into the prover
-- the real SRS Lagrange basis for the proof domain
+This mode captures the real proving-time MSM inputs emitted from the low-level Kimchi prover path. The exported dataset contains the actual `points` and `scalars` used by the internal witness-column commitment MSMs.
 
 Important limitations:
 
 - this path is experimental and depends on `o1js` wasm bindings behavior
 - it is much closer to real prover MSMs than proof-artifact replay
 - if your circuit grows, this is the mode that should produce larger MSM datasets
+
+### Compare CPU Wasm vs WebGPU on Internal Kimchi MSMs
+
+Once `public/datasets/kimchi-internal-msm.json` is exported, generate a CPU wasm baseline:
+
+- **Benchmark the real MSM datasets with CPU wasm and export the results**:  
+  `npm run bench:kimchi-cpu-msm -- public/datasets/kimchi-internal-msm.json --backend=wasm --rounds=3 --cpuMaxN=8192 --out=public/datasets/kimchi-internal-msm-cpu-results.json`
+
+Then replay the same datasets in the browser and compare against that CPU baseline:
+
+- **Benchmark WebGPU and compare correctness + speedup against CPU wasm**:  
+  `npm run bench:browser-cli -- '?dataset=datasets/kimchi-internal-msm.json&cpuResults=datasets/kimchi-internal-msm-cpu-results.json&rounds=3'`
+
+This browser benchmark will report, for each dataset:
+
+- the CPU wasm cold and warm timings
+- the GPU cold and warm timings
+- whether the CPU and GPU MSM results match
+- the `Speedup CPU/GPU cold` and `Speedup CPU/GPU warm median` ratios
 
 ### Probe Low-Level Kimchi Runtime Calls
 
