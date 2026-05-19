@@ -13,6 +13,8 @@ export interface KimchiMsmDatasetJson {
     msmKind:
         | 'srs-commit-evaluations'
         | 'witness-column-commitment'
+        | 'lookup-sorted-commitment'
+        | 'lookup-aggregation-commitment'
         | 'proof-commitments-synthetic'
         | 'proof-opening-synthetic'
         | 'proof-all-points-synthetic';
@@ -31,6 +33,8 @@ export interface KimchiMsmDataset {
     msmKind:
         | 'srs-commit-evaluations'
         | 'witness-column-commitment'
+        | 'lookup-sorted-commitment'
+        | 'lookup-aggregation-commitment'
         | 'proof-commitments-synthetic'
         | 'proof-opening-synthetic'
         | 'proof-all-points-synthetic';
