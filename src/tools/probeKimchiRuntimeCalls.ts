@@ -193,9 +193,11 @@ export async function probeKimchiRuntimeCalls(
         'dist/node/bindings/compiled/node_bindings/plonk_wasm.cjs'
     );
     const kimchiWasmModule = require(kimchiWasmModulePath) as ProbingModule;
-    const plonkWasmModule = require(plonkWasmModulePath) as ProbingModule;
     installProbeWrappers('kimchi_wasm', kimchiWasmModule, events, maxEvents, verbose);
-    installProbeWrappers('plonk_wasm', plonkWasmModule, events, maxEvents, verbose);
+    if (fs.existsSync(plonkWasmModulePath)) {
+        const plonkWasmModule = require(plonkWasmModulePath) as ProbingModule;
+        installProbeWrappers('plonk_wasm', plonkWasmModule, events, maxEvents, verbose);
+    }
 
     const run = await loadProvingEntrypoint(entryFile);
     const bindingsModule = (await import(
