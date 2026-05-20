@@ -41,17 +41,15 @@ async function main() {
 
     console.log(`[browser-proving] target=${target} rounds=${rounds}`);
 
-    let setup;
-    let cold;
     const warmTimingsMs: number[] = [];
     let lastSummary = '';
 
     if (target === 'counter') {
         const { createCounterProofHarness } = await import('../proof/runCounterProof.js');
-        setup = await timeRun(async () => createCounterProofHarness());
+        const setup = await timeRun(async () => createCounterProofHarness());
         console.log(`[browser-proving] setup_total_ms=${setup.elapsedMs.toFixed(2)}`);
 
-        cold = await timeRun(async () => setup.result.proveIncrement());
+        const cold = await timeRun(async () => setup.result.proveIncrement());
         lastSummary = `final_counter=${cold.result.finalCounter}`;
         console.log(
             `[browser-proving] cold_prove_ms=${cold.elapsedMs.toFixed(2)} ${lastSummary}`
@@ -81,10 +79,10 @@ async function main() {
         const { createVaultRollupProofHarness } = await import('../proof/runRollup.js');
         const amount = params.get('amount') ?? '1000000000';
 
-        setup = await timeRun(async () => createVaultRollupProofHarness());
+        const setup = await timeRun(async () => createVaultRollupProofHarness());
         console.log(`[browser-proving] setup_total_ms=${setup.elapsedMs.toFixed(2)}`);
 
-        cold = await timeRun(async () => setup.result.proveDepositNew(amount));
+        const cold = await timeRun(async () => setup.result.proveDepositNew(amount));
         lastSummary = `initial_root=${cold.result.initialRoot} new_root=${cold.result.newRoot}`;
         console.log(
             `[browser-proving] cold_prove_ms=${cold.elapsedMs.toFixed(2)} ${lastSummary}`
