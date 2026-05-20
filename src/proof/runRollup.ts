@@ -12,6 +12,10 @@ import {
     Signature,
     UInt64,
 } from 'o1js';
+import {
+    preloadEmbeddedO1jsCompileCache,
+    type CacheLike,
+} from './embeddedO1jsCompileCache.js';
 
 import {
     AccountLeaf,
@@ -45,6 +49,10 @@ export interface VaultRollupProofHarness {
 
     mergeLastTwoProofs: () => Promise<RootTransition>;
     mergeAllProofs: () => Promise<RootTransition>;
+}
+
+export interface VaultRollupHarnessOptions {
+    compileCache?: CacheLike;
 }
 
 type LocalAccountState = {
@@ -125,7 +133,9 @@ function installGpuMsmHook() {
     });
 }
 
-export async function createVaultRollupProofHarness(): Promise<VaultRollupProofHarness> {
+export async function createVaultRollupProofHarness(
+    options: VaultRollupHarnessOptions = {}
+): Promise<VaultRollupProofHarness> {
     installGpuProofHook();
     installGpuMsmHook();
 
@@ -141,7 +151,13 @@ export async function createVaultRollupProofHarness(): Promise<VaultRollupProofH
 
     console.log('Compiling MinaVaultRollup...');
     const compileStartMs = nowMs();
-    await MinaVaultRollup.compile();
+    const compileCache =
+        options.compileCache ?? (await preloadEmbeddedO1jsCompileCache('rollup'));
+    if (compileCache === undefined) {
+        await MinaVaultRollup.compile();
+    } else {
+        await MinaVaultRollup.compile({ cache: compileCache });
+    }
     logPhase('compile', compileStartMs);
 
     function currentRoot() {

@@ -172,6 +172,9 @@ This browser benchmark will report, for each dataset:
 
 To benchmark actual `o1js` proving in browser conditions, use the browser proving mode:
 
+- **Generate embedded `srs` + `lagrange-basis` cache assets first**:  
+  `npm run cache:o1js-embedded -- rollup counter`
+
 - **Headless browser proving**:  
   `npm run bench:browser-cli -- '?browserProving=counter&rounds=3'`
 
@@ -198,6 +201,9 @@ Implementation note:
 - this mode serves the real `o1js` web build from `/o1js/index.js`
 - and loads the compiled browser entry from `/dist/src/browser-proving/counter-browser.js`
 - it does not bundle the zkApp contract into the benchmark bundle
+- if `/public/o1js-cache/<target>/manifest.json` exists, browser compile automatically preloads
+  embedded `srs`, `lagrange-basis`, and verification-key cache entries before calling `compile()`
+- this intentionally does **not** embed proving keys, only reusable generic compile artifacts
 
 ### Probe Low-Level Kimchi Runtime Calls
 

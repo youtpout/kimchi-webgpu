@@ -1,0 +1,41 @@
+{
+  "version": 1,
+  "entries": [
+    {
+      "persistentId": "step-vk-minavault-approvebase",
+      "uniqueId": "step-vk-minavault-0-approvebase-9a80d7c0862c49d8228ef7f35a16f049",
+      "dataType": "string",
+      "file": "step-vk-minavault-approvebase"
+    },
+    {
+      "persistentId": "step-vk-minavault-deposit",
+      "uniqueId": "step-vk-minavault-1-deposit-4914865b1ba78dbb63e85fcccd2c43d5",
+      "dataType": "string",
+      "file": "step-vk-minavault-deposit"
+    },
+    {
+      "persistentId": "step-vk-minavault-depositreward",
+      "uniqueId": "step-vk-minavault-3-depositreward-5ce7fad984d0c72457266ed2c2f0b615",
+      "dataType": "string",
+      "file": "step-vk-minavault-depositreward"
+    },
+    {
+      "persistentId": "step-vk-minavault-syncrewards",
+      "uniqueId": "step-vk-minavault-4-syncrewards-a74a25916db30333c54bc30151ead317",
+      "dataType": "string",
+      "file": "step-vk-minavault-syncrewards"
+    },
+    {
+      "persistentId": "step-vk-minavault-withdraw",
+      "uniqueId": "step-vk-minavault-2-withdraw-887dadde3c213970f346523496da1adb",
+      "dataType": "string",
+      "file": "step-vk-minavault-withdraw"
+    },
+    {
+      "persistentId": "wrap-vk-minavault",
+      "uniqueId": "wrap-vk-minavault-eca56a0d1eca840e7f20d44aefd69851",
+      "dataType": "string",
+      "file": "wrap-vk-minavault"
+    }
+  ]
+}

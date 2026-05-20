@@ -12,6 +12,10 @@ import {
     UInt64,
 } from 'o1js';
 import { MinaVault } from './counter.js';
+import {
+    preloadEmbeddedO1jsCompileCache,
+    type CacheLike,
+} from './embeddedO1jsCompileCache.js';
 
 setBackend('wasm');
 setNumberOfWorkers(0);
@@ -24,6 +28,10 @@ export interface CounterProofHarness {
         incrementTx: Awaited<ReturnType<typeof Mina.transaction>>;
         finalCounter: string;
     }>;
+}
+
+export interface CounterProofHarnessOptions {
+    compileCache?: CacheLike;
 }
 
 function nowMs() {
@@ -78,7 +86,9 @@ function installGpuMsmHook() {
     });
 }
 
-export async function createCounterProofHarness(): Promise<CounterProofHarness> {
+export async function createCounterProofHarness(
+    options: CounterProofHarnessOptions = {}
+): Promise<CounterProofHarness> {
     installGpuProofHook();
     installGpuMsmHook();
 
@@ -92,7 +102,12 @@ export async function createCounterProofHarness(): Promise<CounterProofHarness> 
 
     console.log('Compiling MinaVault...');
     let phaseStartMs = nowMs();
-    const { verificationKey } = await MinaVault.compile();
+    const compileCache =
+        options.compileCache ?? (await preloadEmbeddedO1jsCompileCache('counter'));
+    const { verificationKey } =
+        compileCache === undefined
+            ? await MinaVault.compile()
+            : await MinaVault.compile({ cache: compileCache });
     phaseStartMs = logPhase('compile', phaseStartMs);
 
     console.log('Deploying MinaVault...');
