@@ -65,6 +65,9 @@ The benchmark uses valid Pallas curve points, verifies CPU/GPU equality on small
 - **Inspect and benchmark exported Kimchi proof artifacts**:  
   `npm run bench:browser-cli -- '?proofArtifact=datasets/counter-proof-artifacts.json&rounds=3'`
 
+- **Run real `o1js` proving inside the browser**:  
+  `npm run bench:browser-cli -- '?browserProving=counter&rounds=3'`
+
 ### Benchmark Query Params
 
 - `sizes`: comma-separated list of MSM sizes
@@ -73,6 +76,7 @@ The benchmark uses valid Pallas curve points, verifies CPU/GPU equality on small
 - `bucketWidthBits`: forces a fixed bucket width for all cases
 - `dataset`: path under `public/` to an exported Kimchi MSM dataset JSON file
 - `proofArtifact`: path under `public/` to an exported Kimchi proof artifact JSON file
+- `browserProving`: run a real browser-side proving flow instead of MSM replay. Current value: `counter`
 
 ## Export Real Kimchi Proof Artifacts
 
@@ -163,6 +167,33 @@ This browser benchmark will report, for each dataset:
 - the GPU cold and warm timings
 - whether the CPU and GPU MSM results match
 - the `Speedup CPU/GPU cold` and `Speedup CPU/GPU warm median` ratios
+
+## Real Browser Proving
+
+To benchmark actual `o1js` proving in browser conditions, use the browser proving mode:
+
+- **Headless browser proving**:  
+  `npm run bench:browser-cli -- '?browserProving=counter&rounds=3'`
+
+- **Interactive browser proving**:  
+  `npm run bench:browser -- '?browserProving=counter&rounds=3'`
+
+This runs the real `runCounterProof()` flow inside Brave, not in Node. The output reports:
+
+- `setup_total_ms`
+- `cold_prove_ms`
+- per-round `warm_prove_round`
+- `warm_prove_median_ms`
+
+Current proving target:
+
+- `counter` -> [runCounterProof.ts](/home/eddy/Projects/kimchi-webgpu/src/proof/runCounterProof.ts)
+
+Implementation note:
+
+- this mode serves the real `o1js` web build from `/o1js/index.js`
+- and loads the compiled browser entry from `/dist/src/browser-proving/counter-browser.js`
+- it does not bundle the zkApp contract into the benchmark bundle
 
 ### Probe Low-Level Kimchi Runtime Calls
 

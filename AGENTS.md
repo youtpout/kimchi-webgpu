@@ -94,6 +94,17 @@ cd /home/eddy/Projects/kimchi-webgpu
 npm run bench:browser-cli -- '?dataset=datasets/kimchi-internal-msm.json&rounds=3'
 ```
 
+## Real Browser Proving
+
+To run the actual `o1js` proving flow in browser conditions:
+
+```bash
+cd /home/eddy/Projects/kimchi-webgpu
+npm run bench:browser-cli -- '?browserProving=counter&rounds=3'
+```
+
+This executes [runCounterProof.ts](/home/eddy/Projects/kimchi-webgpu/src/proof/runCounterProof.ts) inside Brave, not in Node.
+
 ## Current Status
 
 - Real proving-time dataset capture works

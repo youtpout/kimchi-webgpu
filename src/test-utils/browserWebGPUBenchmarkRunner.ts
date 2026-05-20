@@ -3,16 +3,22 @@ import path from 'path';
 import { spawn } from 'child_process';
 
 async function main() {
-  const entryFile = path.resolve(ROOT_DIR, 'src/benchmarks/index.ts');
-  await bundleTests(
-    entryFile,
-    'bundle.benchmarks.js',
-    'index.benchmarks.html'
-  );
-
   const extraQuery = process.argv[2] ?? '';
+  const browserProvingMode = new URLSearchParams(
+    extraQuery.startsWith('?') ? extraQuery.slice(1) : extraQuery
+  ).get('browserProving');
+  if (!browserProvingMode) {
+    const entryFile = path.resolve(ROOT_DIR, 'src/benchmarks/index.ts');
+    await bundleTests(
+      entryFile,
+      'bundle.benchmarks.js',
+      'index.benchmarks.html'
+    );
+  }
   const { url: baseUrl } = await startServer();
-  const benchmarkBaseUrl = baseUrl.replace('/index.html', '/index.benchmarks.html');
+  const benchmarkBaseUrl = browserProvingMode
+    ? baseUrl.replace('/index.html', '/browser-proving.html')
+    : baseUrl.replace('/index.html', '/index.benchmarks.html');
   const url = extraQuery ? `${benchmarkBaseUrl}${extraQuery}` : benchmarkBaseUrl;
   const brave = findBrave();
 

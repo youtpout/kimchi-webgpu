@@ -5,6 +5,7 @@ import { execSync } from 'child_process';
 import * as esbuild from 'esbuild';
 import { fileURLToPath } from 'url';
 import os from 'os';
+import { createRequire } from 'module';
 
 export const __filename = fileURLToPath(import.meta.url);
 export const __dirname = path.dirname(__filename);
@@ -12,6 +13,16 @@ export const __dirname = path.dirname(__filename);
 // Root and public folder
 export const ROOT_DIR = path.resolve(__dirname, '..', '..', '..');
 export const PUBLIC_DIR = path.resolve(ROOT_DIR, 'public');
+const require = createRequire(import.meta.url);
+const O1JS_ENTRYPOINT = require.resolve('o1js');
+const O1JS_PACKAGE_ROOT = path.resolve(path.dirname(O1JS_ENTRYPOINT), '..', '..');
+const O1JS_WEB_DIR = path.resolve(O1JS_PACKAGE_ROOT, 'dist', 'web');
+const TSLIB_ESM_PATH = path.resolve(
+    ROOT_DIR,
+    'node_modules',
+    'tslib',
+    'tslib.es6.js'
+);
 
 /** Find Brave Nightly executable */
 export function findBrave(): string {
@@ -45,7 +56,15 @@ export function findBrave(): string {
 /** Start Express server serving public folder */
 export async function startServer(port = 3001) {
     const app = express();
+    app.use((_, res, next) => {
+        res.setHeader('Cross-Origin-Embedder-Policy', 'require-corp');
+        res.setHeader('Cross-Origin-Opener-Policy', 'same-origin');
+        next();
+    });
     app.use(express.static(PUBLIC_DIR));
+    app.use('/dist', express.static(path.resolve(ROOT_DIR, 'dist')));
+    app.use('/o1js', express.static(O1JS_WEB_DIR));
+    app.use('/vendor/tslib', express.static(path.dirname(TSLIB_ESM_PATH)));
 
     return new Promise<{ server: any; url: string }>((resolve) => {
         const server = app.listen(port, () => {
