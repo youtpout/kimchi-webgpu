@@ -1,5 +1,6 @@
 async function main() {
     const params = new URLSearchParams(window.location.search);
+    const target = params.get('browserProving') ?? 'counter';
     const roundsParam = params.get('rounds');
     const rounds = roundsParam ? Number.parseInt(roundsParam, 10) : 1;
 
@@ -7,14 +8,27 @@ async function main() {
         throw new Error(`Invalid rounds parameter: ${roundsParam}`);
     }
 
-    console.log(`[browser-proving] target=counter rounds=${rounds}`);
-
-    const { createCounterProofHarness } = await import('../proof/runCounterProof.js');
-
     const timeRun = async <T>(run: () => Promise<T>) => {
         const startMs = performance.now();
         const result = await run();
         return { result, elapsedMs: performance.now() - startMs };
+    };
+
+    const formatError = (error: unknown) => {
+        if (error instanceof Error) {
+            return {
+                name: error.name,
+                message: error.message,
+                stack: error.stack,
+            };
+        }
+        if (typeof error === 'object' && error !== null) {
+            const serialized = Object.fromEntries(
+                Object.entries(error).map(([key, value]) => [key, String(value)])
+            );
+            return serialized;
+        }
+        return { value: String(error) };
     };
 
     const median = (values: number[]) => {
@@ -25,24 +39,95 @@ async function main() {
             : sorted[mid];
     };
 
-    const setup = await timeRun(async () => createCounterProofHarness());
-    console.log(`[browser-proving] setup_total_ms=${setup.elapsedMs.toFixed(2)}`);
+    console.log(`[browser-proving] target=${target} rounds=${rounds}`);
 
-    const cold = await timeRun(async () => setup.result.proveIncrement());
-    console.log(
-        `[browser-proving] cold_prove_ms=${cold.elapsedMs.toFixed(2)} final_counter=${cold.result.finalCounter}`
-    );
-
+    let setup;
+    let cold;
     const warmTimingsMs: number[] = [];
-    let lastFinalCounter = cold.result.finalCounter;
+    let lastSummary = '';
 
-    for (let i = 0; i < rounds; i++) {
-        const warm = await timeRun(async () => setup.result.proveIncrement());
-        warmTimingsMs.push(warm.elapsedMs);
-        lastFinalCounter = warm.result.finalCounter;
+    if (target === 'counter') {
+        const { createCounterProofHarness } = await import('../proof/runCounterProof.js');
+        setup = await timeRun(async () => createCounterProofHarness());
+        console.log(`[browser-proving] setup_total_ms=${setup.elapsedMs.toFixed(2)}`);
+
+        cold = await timeRun(async () => setup.result.proveIncrement());
+        lastSummary = `final_counter=${cold.result.finalCounter}`;
         console.log(
-            `[browser-proving] warm_prove_round=${i + 1} elapsed_ms=${warm.elapsedMs.toFixed(2)} final_counter=${warm.result.finalCounter}`
+            `[browser-proving] cold_prove_ms=${cold.elapsedMs.toFixed(2)} ${lastSummary}`
         );
+
+        for (let i = 0; i < rounds; i++) {
+            let warm;
+            try {
+                warm = await timeRun(async () => setup.result.proveIncrement());
+            } catch (error) {
+                console.error(
+                    '[browser-proving] warm_prove_failed',
+                    JSON.stringify({
+                        round: i + 1,
+                        ...formatError(error),
+                    })
+                );
+                throw error;
+            }
+            warmTimingsMs.push(warm.elapsedMs);
+            lastSummary = `final_counter=${warm.result.finalCounter}`;
+            console.log(
+                `[browser-proving] warm_prove_round=${i + 1} elapsed_ms=${warm.elapsedMs.toFixed(2)} ${lastSummary}`
+            );
+        }
+    } else if (target === 'rollup-deposit-new') {
+        const { createVaultRollupProofHarness } = await import('../proof/runRollup.js');
+        const amount = params.get('amount') ?? '1000000000';
+
+        setup = await timeRun(async () => createVaultRollupProofHarness());
+        console.log(`[browser-proving] setup_total_ms=${setup.elapsedMs.toFixed(2)}`);
+
+        cold = await timeRun(async () => setup.result.proveDepositNew(amount));
+        lastSummary = `initial_root=${cold.result.initialRoot} new_root=${cold.result.newRoot}`;
+        console.log(
+            `[browser-proving] cold_prove_ms=${cold.elapsedMs.toFixed(2)} ${lastSummary}`
+        );
+
+        for (let i = 0; i < rounds; i++) {
+            let warm;
+            try {
+                warm = await timeRun(async () => createVaultRollupProofHarness());
+            } catch (error) {
+                console.error(
+                    '[browser-proving] warm_setup_failed',
+                    JSON.stringify({
+                        round: i + 1,
+                        ...formatError(error),
+                    })
+                );
+                throw error;
+            }
+            console.log(
+                `[browser-proving] warm_setup_round=${i + 1} elapsed_ms=${warm.elapsedMs.toFixed(2)}`
+            );
+            let prove;
+            try {
+                prove = await timeRun(async () => warm.result.proveDepositNew(amount));
+            } catch (error) {
+                console.error(
+                    '[browser-proving] warm_prove_failed',
+                    JSON.stringify({
+                        round: i + 1,
+                        ...formatError(error),
+                    })
+                );
+                throw error;
+            }
+            warmTimingsMs.push(prove.elapsedMs);
+            lastSummary = `initial_root=${prove.result.initialRoot} new_root=${prove.result.newRoot}`;
+            console.log(
+                `[browser-proving] warm_prove_round=${i + 1} elapsed_ms=${prove.elapsedMs.toFixed(2)} ${lastSummary}`
+            );
+        }
+    } else {
+        throw new Error(`Unsupported browserProving target: ${target}`);
     }
 
     console.log(
@@ -54,8 +139,8 @@ async function main() {
         `[browser-proving] warm_prove_median_ms=${median(warmTimingsMs).toFixed(2)}`
     );
 
-    if (lastFinalCounter !== '0') {
-        throw new Error(`Unexpected final counter state: ${lastFinalCounter}`);
+    if (target === 'counter' && lastSummary !== 'final_counter=0') {
+        throw new Error(`Unexpected counter summary: ${lastSummary}`);
     }
 
     (window as any).testsFailures = 0;
@@ -63,7 +148,11 @@ async function main() {
 }
 
 main().catch((error) => {
-    console.error('[browser-proving] fatal', error);
+    console.error('[browser-proving] fatal', JSON.stringify(error instanceof Error ? {
+        name: error.name,
+        message: error.message,
+        stack: error.stack,
+    } : error));
     (window as any).testsFailures = 1;
     (window as any).testsFinished = true;
 });

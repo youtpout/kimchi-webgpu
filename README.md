@@ -178,6 +178,9 @@ To benchmark actual `o1js` proving in browser conditions, use the browser provin
 - **Interactive browser proving**:  
   `npm run bench:browser -- '?browserProving=counter&rounds=3'`
 
+- **Headless browser proving, rollup `depositNew()` only**:  
+  `npm run bench:browser-cli -- '?browserProving=rollup-deposit-new&rounds=3'`
+
 This runs the real `runCounterProof()` flow inside Brave, not in Node. The output reports:
 
 - `setup_total_ms`
@@ -188,6 +191,7 @@ This runs the real `runCounterProof()` flow inside Brave, not in Node. The outpu
 Current proving target:
 
 - `counter` -> [runCounterProof.ts](/home/eddy/Projects/kimchi-webgpu/src/proof/runCounterProof.ts)
+- `rollup-deposit-new` -> [runRollup.ts](/home/eddy/Projects/kimchi-webgpu/src/proof/runRollup.ts), calling only `proveDepositNew()`
 
 Implementation note:
 
