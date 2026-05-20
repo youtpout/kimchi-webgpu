@@ -12,15 +12,6 @@ import {
 import { kimchiMsmDatasetFileFromJson } from '../datasets/kimchiMsmDataset.js';
 import type { Point } from '../types/point.js';
 
-const PALLAS_BASE_FIELD =
-    0x40000000000000000000000000000000224698fc094cf91b992d30ed00000001n;
-const PALLAS_SCALAR_FIELD =
-    0x40000000000000000000000000000000224698fc0994a8dd8c46eb2100000001n;
-const VESTA_BASE_FIELD =
-    0x40000000000000000000000000000000224698fc0994a8dd8c46eb2100000001n;
-const VESTA_SCALAR_FIELD =
-    0x40000000000000000000000000000000224698fc094cf91b992d30ed00000001n;
-
 interface CpuPoint {
     x: bigint;
     y: bigint;
@@ -40,8 +31,6 @@ interface CpuBenchmarkResultFile {
         result: { x: string; y: string };
     }[];
 }
-
-const CPU_INFINITY: CpuPoint = { x: 0n, y: 0n, isInfinity: true };
 
 async function getDevice(): Promise<GPUDevice> {
     const adapter = await navigator.gpu.requestAdapter();
@@ -83,110 +72,12 @@ function median(values: number[]): number {
         : sorted[mid];
 }
 
-function curveParams(curve: 'pallas' | 'vesta') {
-    return curve === 'pallas'
-        ? { baseField: PALLAS_BASE_FIELD, scalarField: PALLAS_SCALAR_FIELD }
-        : { baseField: VESTA_BASE_FIELD, scalarField: VESTA_SCALAR_FIELD };
-}
-
-function fpMod(a: bigint, modulus: bigint): bigint {
-    return ((a % modulus) + modulus) % modulus;
-}
-
-function fpSub(a: bigint, b: bigint, modulus: bigint): bigint {
-    return fpMod(a - b, modulus);
-}
-
-function fpMul(a: bigint, b: bigint, modulus: bigint): bigint {
-    return fpMod(a * b, modulus);
-}
-
-function fpPow(base: bigint, exp: bigint, modulus: bigint): bigint {
-    let result = 1n;
-    base = fpMod(base, modulus);
-    while (exp > 0n) {
-        if (exp & 1n) result = fpMul(result, base, modulus);
-        exp >>= 1n;
-        base = fpMul(base, base, modulus);
-    }
-    return result;
-}
-
-function fpInv(a: bigint, modulus: bigint): bigint {
-    return fpPow(a, modulus - 2n, modulus);
-}
-
-function cpuAdd(p: CpuPoint, q: CpuPoint, modulus: bigint): CpuPoint {
-    if (p.isInfinity) return q;
-    if (q.isInfinity) return p;
-    if (p.x === q.x) {
-        if (p.y !== q.y) return CPU_INFINITY;
-        return cpuDouble(p, modulus);
-    }
-    const lambda = fpMul(
-        fpSub(q.y, p.y, modulus),
-        fpInv(fpSub(q.x, p.x, modulus), modulus),
-        modulus
-    );
-    const x3 = fpSub(fpSub(fpMul(lambda, lambda, modulus), p.x, modulus), q.x, modulus);
-    const y3 = fpSub(fpMul(lambda, fpSub(p.x, x3, modulus), modulus), p.y, modulus);
-    return { x: x3, y: y3, isInfinity: false };
-}
-
-function cpuDouble(p: CpuPoint, modulus: bigint): CpuPoint {
-    if (p.isInfinity) return p;
-    const lambda = fpMul(
-        fpMul(3n, fpMul(p.x, p.x, modulus), modulus),
-        fpInv(fpMul(2n, p.y, modulus), modulus),
-        modulus
-    );
-    const x3 = fpSub(fpMul(lambda, lambda, modulus), fpMul(2n, p.x, modulus), modulus);
-    const y3 = fpSub(fpMul(lambda, fpSub(p.x, x3, modulus), modulus), p.y, modulus);
-    return { x: x3, y: y3, isInfinity: false };
-}
-
-function cpuScalarMul(k: bigint, p: CpuPoint, curve: 'pallas' | 'vesta'): CpuPoint {
-    const { baseField, scalarField } = curveParams(curve);
-    k = ((k % scalarField) + scalarField) % scalarField;
-    let r = CPU_INFINITY;
-    let base = p;
-    while (k > 0n) {
-        if (k & 1n) r = cpuAdd(r, base, baseField);
-        base = cpuDouble(base, baseField);
-        k >>= 1n;
-    }
-    return r;
-}
-
-function cpuMSM(
-    scalars: bigint[],
-    points: Point[],
-    curve: 'pallas' | 'vesta'
-): CpuPoint {
-    const { baseField } = curveParams(curve);
-    let acc = CPU_INFINITY;
-    for (let i = 0; i < scalars.length; i++) {
-        acc = cpuAdd(
-            acc,
-            cpuScalarMul(scalars[i], { ...points[i], isInfinity: false }, curve),
-            baseField
-        );
-    }
-    return acc;
-}
-
 function pointMismatchSummary(
     gpu: Point,
     cpu: CpuPoint,
-    curve: 'pallas' | 'vesta'
+    _curve: 'pallas' | 'vesta'
 ): string | null {
-    const { baseField } = curveParams(curve);
     if (gpu.x === cpu.x && gpu.y === cpu.y) return null;
-
-    const negCpuY = fpMod(-cpu.y, baseField);
-    if (gpu.x === cpu.x && gpu.y === negCpuY) {
-        return 'same x but negated y (gpu.y = -cpu.y mod p)';
-    }
 
     return `x mismatch: gpu=${gpu.x} cpu=${cpu.x}; y mismatch: gpu=${gpu.y} cpu=${cpu.y}`;
 }
@@ -325,13 +216,14 @@ if (requestedDataset) {
                 const roundsParam = params.get('rounds');
                 const rounds = roundsParam ? Number.parseInt(roundsParam, 10) : 3;
                 const batchMsms = params.get('batchMsms') === '1';
-                const cpuMaxNParam = params.get('cpuMaxN');
-                const cpuMaxN = cpuMaxNParam
-                    ? Number.parseInt(cpuMaxNParam, 10)
-                    : 4096;
                 const cpuBenchmarkFile = await fetchCpuBenchmarkFile();
+                if (!cpuBenchmarkFile) {
+                    throw new Error(
+                        'Missing cpuResults query parameter. Generate CPU wasm results with bench:kimchi-cpu-msm and pass cpuResults=datasets/...json'
+                    );
+                }
                 const cpuBenchmarks = new Map(
-                    (cpuBenchmarkFile?.results ?? []).map((entry) => [entry.label, entry])
+                    cpuBenchmarkFile.results.map((entry) => [entry.label, entry])
                 );
                 const device = await getDevice();
                 const batchedWarmResults = batchMsms
@@ -361,6 +253,11 @@ if (requestedDataset) {
                     );
                 }
 
+                let totalCpuColdMs = 0;
+                let totalCpuWarmMedianMs = 0;
+                let totalGpuColdMs = 0;
+                let totalGpuWarmMedianMs = 0;
+
                 for (const dataset of datasetFile.datasets) {
                     console.log('');
                     console.log(`=== Dataset: ${dataset.label} ===`);
@@ -374,33 +271,23 @@ if (requestedDataset) {
                         `${dataset.label} scalar/point length mismatch`
                     );
 
-                    let cpuMs: number | null = null;
-                    let cpuColdMs: number | null = null;
-                    let cpuResult: CpuPoint | null = null;
                     const cpuBenchmark = cpuBenchmarks.get(dataset.label);
-                    if (cpuBenchmark) {
-                        cpuColdMs = cpuBenchmark.coldMs;
-                        cpuMs = cpuBenchmark.medianWarmMs;
-                        cpuResult = {
-                            x: BigInt(cpuBenchmark.result.x),
-                            y: BigInt(cpuBenchmark.result.y),
-                            isInfinity: false,
-                        };
-                        console.log(`CPU wasm cold run: ${cpuColdMs.toFixed(2)} ms`);
-                        console.log(`CPU wasm median warm run: ${cpuMs.toFixed(2)} ms`);
-                    } else if (dataset.pointCount <= cpuMaxN) {
-                        const cpuStart = performance.now();
-                        cpuResult = cpuMSM(
-                            dataset.scalars,
-                            dataset.points,
-                            dataset.curve
+                    if (!cpuBenchmark) {
+                        throw new Error(
+                            `Missing CPU wasm benchmark result for dataset ${dataset.label}`
                         );
-                        cpuMs = performance.now() - cpuStart;
-                        cpuColdMs = cpuMs;
-                        console.log(`CPU reference: ${cpuMs.toFixed(2)} ms`);
-                    } else {
-                        console.log('CPU reference skipped for this dataset');
                     }
+                    const cpuColdMs = cpuBenchmark.coldMs;
+                    const cpuMs = cpuBenchmark.medianWarmMs;
+                    const cpuResult: CpuPoint = {
+                        x: BigInt(cpuBenchmark.result.x),
+                        y: BigInt(cpuBenchmark.result.y),
+                        isInfinity: false,
+                    };
+                    console.log(`CPU wasm cold run: ${cpuColdMs.toFixed(2)} ms`);
+                    console.log(`CPU wasm median warm run: ${cpuMs.toFixed(2)} ms`);
+                    totalCpuColdMs += cpuColdMs;
+                    totalCpuWarmMedianMs += cpuMs;
 
                     const coldStart = performance.now();
                     const coldResult = await runCold(
@@ -415,6 +302,7 @@ if (requestedDataset) {
                     console.log(
                         `Cold result x: ${coldResult.x.toString().slice(0, 24)}...`
                     );
+                    totalGpuColdMs += coldMs;
 
                     let result: Point;
                     let timingsMs: number[];
@@ -462,30 +350,50 @@ if (requestedDataset) {
                     console.log(
                         `Warm result x: ${result.x.toString().slice(0, 24)}...`
                     );
+                    totalGpuWarmMedianMs += medianMs;
 
-                    if (cpuMs !== null && cpuResult !== null) {
-                        const mismatch = pointMismatchSummary(
-                            result,
-                            cpuResult,
-                            dataset.curve
-                        );
-                        expect(
-                            mismatch,
-                            mismatch === null
-                                ? undefined
-                                : `${dataset.label} CPU/GPU mismatch: ${mismatch}`
-                        ).to.equal(null);
-                        console.log('Correctness: CPU/GPU match');
-                        if (cpuColdMs !== null) {
-                            console.log(
-                                `Speedup CPU/GPU cold: ${(cpuColdMs / coldMs).toFixed(2)}x`
-                            );
-                        }
-                        console.log(
-                            `Speedup CPU/GPU warm median: ${(cpuMs / medianMs).toFixed(2)}x`
-                        );
-                    }
+                    const mismatch = pointMismatchSummary(
+                        result,
+                        cpuResult,
+                        dataset.curve
+                    );
+                    expect(
+                        mismatch,
+                        mismatch === null
+                            ? undefined
+                            : `${dataset.label} CPU/GPU mismatch: ${mismatch}`
+                    ).to.equal(null);
+                    console.log('Correctness: CPU/GPU match');
+                    console.log(
+                        `Speedup CPU/GPU cold: ${(cpuColdMs / coldMs).toFixed(2)}x`
+                    );
+                    console.log(
+                        `Speedup CPU/GPU warm median: ${(cpuMs / medianMs).toFixed(2)}x`
+                    );
                 }
+
+                console.log('');
+                console.log('=== Total comparison ===');
+                console.log(
+                    `CPU wasm total cold: ${totalCpuColdMs.toFixed(2)} ms`
+                );
+                console.log(
+                    `CPU wasm total median warm: ${totalCpuWarmMedianMs.toFixed(2)} ms`
+                );
+                console.log(`GPU total cold: ${totalGpuColdMs.toFixed(2)} ms`);
+                console.log(
+                    `GPU total median warm: ${totalGpuWarmMedianMs.toFixed(2)} ms`
+                );
+                console.log(
+                    `Total speedup CPU/GPU cold: ${(
+                        totalCpuColdMs / totalGpuColdMs
+                    ).toFixed(2)}x`
+                );
+                console.log(
+                    `Total speedup CPU/GPU warm median: ${(
+                        totalCpuWarmMedianMs / totalGpuWarmMedianMs
+                    ).toFixed(2)}x`
+                );
             },
             1_800_000
         );

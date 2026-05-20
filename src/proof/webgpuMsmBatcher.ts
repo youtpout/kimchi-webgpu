@@ -1,12 +1,4 @@
 import type { GpuMsmContext, GpuMsmRunner } from 'o1js';
-import {
-    createPippengerMSMPallasRunner,
-    type PippengerMSMJob as PallasPippengerMSMJob,
-} from '../gpu/256bit/pallas/pippenger_msm.js';
-import {
-    createPippengerMSMVestaRunner,
-    type PippengerMSMJob as VestaPippengerMSMJob,
-} from '../gpu/256bit/vesta/pippenger_msm.js';
 import type { Point } from '../types/point.js';
 
 type PendingRequest = {
@@ -16,6 +8,8 @@ type PendingRequest = {
 };
 
 let sharedDevicePromise: Promise<GPUDevice | null> | undefined;
+let pallasModulePromise: Promise<typeof import('../gpu/256bit/pallas/pippenger_msm.js')> | undefined;
+let vestaModulePromise: Promise<typeof import('../gpu/256bit/vesta/pippenger_msm.js')> | undefined;
 
 async function getSharedDevice() {
     if (typeof navigator === 'undefined' || navigator.gpu === undefined) {
@@ -27,6 +21,16 @@ async function getSharedDevice() {
         return await adapter.requestDevice();
     })();
     return await sharedDevicePromise;
+}
+
+async function loadPallasModule() {
+    pallasModulePromise ??= import('../gpu/256bit/pallas/pippenger_msm.js');
+    return await pallasModulePromise;
+}
+
+async function loadVestaModule() {
+    vestaModulePromise ??= import('../gpu/256bit/vesta/pippenger_msm.js');
+    return await vestaModulePromise;
 }
 
 function isAffinePoint(point: { x?: unknown; y?: unknown } | null): point is Point {
@@ -122,14 +126,17 @@ export function createWebGpuBatchedMsmRunner(options?: {
             }
 
             try {
-                const results =
-                    curve === 'pallas'
-                        ? await createPippengerMSMPallasRunner(device, {
+                const results = curve === 'pallas'
+                    ? await (await loadPallasModule())
+                          .createPippengerMSMPallasRunner(device, {
                               bucketWidthBits,
-                          }).runMany(jobs as PallasPippengerMSMJob[], { verbose: false })
-                        : await createPippengerMSMVestaRunner(device, {
+                          })
+                          .runMany(jobs, { verbose: false })
+                    : await (await loadVestaModule())
+                          .createPippengerMSMVestaRunner(device, {
                               bucketWidthBits,
-                          }).runMany(jobs as VestaPippengerMSMJob[], { verbose: false });
+                          })
+                          .runMany(jobs, { verbose: false });
 
                 for (let i = 0; i < requests.length; i++) {
                     requests[i].resolve(results[i]);

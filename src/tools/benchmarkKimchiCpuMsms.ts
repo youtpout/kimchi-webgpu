@@ -255,16 +255,34 @@ async function main() {
 
     console.log('');
     console.log('=== CPU summary ===');
+    let totalColdMs = 0;
+    let totalMedianWarmMs = 0;
     for (const [key, group] of groups) {
         const medianOfMedians = median(group.map((entry) => entry.medianWarmMs));
         const avgCold =
             group.reduce((sum, entry) => sum + entry.coldMs, 0) / group.length;
+        const totalGroupColdMs = group.reduce((sum, entry) => sum + entry.coldMs, 0);
+        const totalGroupMedianWarmMs = group.reduce(
+            (sum, entry) => sum + entry.medianWarmMs,
+            0
+        );
+        totalColdMs += totalGroupColdMs;
+        totalMedianWarmMs += totalGroupMedianWarmMs;
         console.log(
             `${key} datasets=${group.length} avg_cold_ms=${avgCold.toFixed(
                 2
-            )} median_warm_ms=${medianOfMedians.toFixed(2)}`
+            )} median_warm_ms=${medianOfMedians.toFixed(
+                2
+            )} total_cold_ms=${totalGroupColdMs.toFixed(
+                2
+            )} total_median_warm_ms=${totalGroupMedianWarmMs.toFixed(2)}`
         );
     }
+    console.log(
+        `total datasets=${results.length} total_cold_ms=${totalColdMs.toFixed(
+            2
+        )} total_median_warm_ms=${totalMedianWarmMs.toFixed(2)}`
+    );
 
     if (args.outFile) {
         const outPath = path.resolve(args.outFile);
