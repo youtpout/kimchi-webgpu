@@ -16,6 +16,7 @@ import {
     preloadEmbeddedO1jsCompileCache,
     type CacheLike,
 } from './embeddedO1jsCompileCache.js';
+import { createWebGpuBatchedMsmRunner } from './webgpuMsmBatcher.js';
 
 setBackend('wasm');
 setNumberOfWorkers(0);
@@ -65,25 +66,7 @@ function installGpuProofHook() {
 
 function installGpuMsmHook() {
     if (getGpuMsmRunner() !== undefined) return;
-
-    setGpuMsmRunner(({ curve, msmKind, scalars, points, cpuFallback, metadata }) => {
-        const scalarCount = scalars?.length ?? 0;
-        const pointCount = points?.length ?? 0;
-        const domainSize =
-            typeof metadata === 'object' &&
-            metadata !== null &&
-            'domainSize' in metadata &&
-            typeof (metadata as { domainSize?: unknown }).domainSize === 'number'
-                ? (metadata as { domainSize: number }).domainSize
-                : undefined;
-
-        console.log(
-            `GPU MSM runner called: kind=${msmKind} curve=${curve} scalars=${scalarCount} points=${pointCount}` +
-                (domainSize === undefined ? '' : ` domainSize=${domainSize}`)
-        );
-
-        return cpuFallback?.();
-    });
+    setGpuMsmRunner(createWebGpuBatchedMsmRunner());
 }
 
 export async function createCounterProofHarness(

@@ -2,10 +2,12 @@ import { expect } from 'chai';
 import {
     createPippengerMSMPallasRunner,
     pippengerMSMPallas,
+    type PippengerMSMJob as PallasPippengerMSMJob,
 } from '../gpu/256bit/pallas/pippenger_msm.js';
 import {
     createPippengerMSMVestaRunner,
     pippengerMSMVesta,
+    type PippengerMSMJob as VestaPippengerMSMJob,
 } from '../gpu/256bit/vesta/pippenger_msm.js';
 import { kimchiMsmDatasetFileFromJson } from '../datasets/kimchiMsmDataset.js';
 import type { Point } from '../types/point.js';
@@ -209,6 +211,10 @@ function createRunner(
     device: GPUDevice,
     curve: 'pallas' | 'vesta'
 ): {
+    runMany?: (
+        jobs: { scalars: bigint[]; points: Point[]; label?: string }[],
+        config?: { verbose?: boolean }
+    ) => Promise<Point[]>;
     run: (
         scalars: bigint[],
         points: Point[],
@@ -218,6 +224,72 @@ function createRunner(
     return curve === 'pallas'
         ? createPippengerMSMPallasRunner(device, { bucketWidthBits: 8 })
         : createPippengerMSMVestaRunner(device, { bucketWidthBits: 8 });
+}
+
+async function runWarmBatch(
+    device: GPUDevice,
+    datasets: {
+        label: string;
+        curve: 'pallas' | 'vesta';
+        scalars: bigint[];
+        points: Point[];
+    }[],
+    rounds: number
+) {
+    const pallasRunner = createPippengerMSMPallasRunner(device, {
+        bucketWidthBits: 8,
+    });
+    const vestaRunner = createPippengerMSMVestaRunner(device, {
+        bucketWidthBits: 8,
+    });
+
+    const pallasJobs: PallasPippengerMSMJob[] = datasets
+        .filter((dataset) => dataset.curve === 'pallas')
+        .map((dataset) => ({
+            label: dataset.label,
+            scalars: dataset.scalars,
+            points: dataset.points,
+        }));
+    const vestaJobs: VestaPippengerMSMJob[] = datasets
+        .filter((dataset) => dataset.curve === 'vesta')
+        .map((dataset) => ({
+            label: dataset.label,
+            scalars: dataset.scalars,
+            points: dataset.points,
+        }));
+
+    if (pallasJobs.length > 0) {
+        await pallasRunner.runMany!(pallasJobs, { verbose: false });
+    }
+    if (vestaJobs.length > 0) {
+        await vestaRunner.runMany!(vestaJobs, { verbose: false });
+    }
+
+    const timingsMs: number[] = [];
+    let lastResults = new Map<string, Point>();
+
+    for (let round = 0; round < rounds; round++) {
+        const start = performance.now();
+        const roundResults = new Map<string, Point>();
+
+        if (pallasJobs.length > 0) {
+            const results = await pallasRunner.runMany!(pallasJobs, { verbose: false });
+            for (let i = 0; i < pallasJobs.length; i++) {
+                roundResults.set(pallasJobs[i].label ?? `pallas-${i}`, results[i]);
+            }
+        }
+        if (vestaJobs.length > 0) {
+            const results = await vestaRunner.runMany!(vestaJobs, { verbose: false });
+            for (let i = 0; i < vestaJobs.length; i++) {
+                roundResults.set(vestaJobs[i].label ?? `vesta-${i}`, results[i]);
+            }
+        }
+
+        timingsMs.push(performance.now() - start);
+        lastResults = roundResults;
+    }
+
+    return { timingsMs, results: lastResults };
 }
 
 async function runCold(
@@ -252,6 +324,7 @@ if (requestedDataset) {
                 const params = new URLSearchParams(window.location.search);
                 const roundsParam = params.get('rounds');
                 const rounds = roundsParam ? Number.parseInt(roundsParam, 10) : 3;
+                const batchMsms = params.get('batchMsms') === '1';
                 const cpuMaxNParam = params.get('cpuMaxN');
                 const cpuMaxN = cpuMaxNParam
                     ? Number.parseInt(cpuMaxNParam, 10)
@@ -261,6 +334,32 @@ if (requestedDataset) {
                     (cpuBenchmarkFile?.results ?? []).map((entry) => [entry.label, entry])
                 );
                 const device = await getDevice();
+                const batchedWarmResults = batchMsms
+                    ? await runWarmBatch(
+                          device,
+                          datasetFile.datasets.map((dataset) => ({
+                              label: dataset.label,
+                              curve: dataset.curve,
+                              scalars: dataset.scalars,
+                              points: dataset.points,
+                          })),
+                          rounds
+                      )
+                    : null;
+
+                if (batchMsms && batchedWarmResults) {
+                    console.log('');
+                    console.log(
+                        `[batched-msm] warm batch runs: ${batchedWarmResults.timingsMs
+                            .map((ms) => ms.toFixed(2))
+                            .join(', ')} ms`
+                    );
+                    console.log(
+                        `[batched-msm] warm batch median: ${median(
+                            batchedWarmResults.timingsMs
+                        ).toFixed(2)} ms`
+                    );
+                }
 
                 for (const dataset of datasetFile.datasets) {
                     console.log('');
@@ -317,26 +416,49 @@ if (requestedDataset) {
                         `Cold result x: ${coldResult.x.toString().slice(0, 24)}...`
                     );
 
-                    const runner = createRunner(device, dataset.curve);
-                    await runner.run(dataset.scalars, dataset.points, {
-                        verbose: false,
-                    });
+                    let result: Point;
+                    let timingsMs: number[];
+                    let medianMs: number;
 
-                    const { result, timingsMs } = await runTimed(
-                        () =>
-                            runner.run(dataset.scalars, dataset.points, {
-                                verbose: false,
-                            }),
-                        rounds
-                    );
+                    if (batchMsms && batchedWarmResults) {
+                        const batchedResult = batchedWarmResults.results.get(dataset.label);
+                        if (!batchedResult) {
+                            throw new Error(`Missing batched result for dataset ${dataset.label}`);
+                        }
+                        result = batchedResult;
+                        timingsMs = batchedWarmResults.timingsMs;
+                        medianMs = median(timingsMs);
+                        console.log(
+                            `GPU warm runs (batched): ${timingsMs
+                                .map((ms) => ms.toFixed(2))
+                                .join(', ')} ms`
+                        );
+                        console.log(
+                            `GPU median warm run (batched): ${medianMs.toFixed(2)} ms`
+                        );
+                    } else {
+                        const runner = createRunner(device, dataset.curve);
+                        await runner.run(dataset.scalars, dataset.points, {
+                            verbose: false,
+                        });
 
-                    const medianMs = median(timingsMs);
-                    console.log(
-                        `GPU warm runs: ${timingsMs
-                            .map((ms) => ms.toFixed(2))
-                            .join(', ')} ms`
-                    );
-                    console.log(`GPU median warm run: ${medianMs.toFixed(2)} ms`);
+                        const timed = await runTimed(
+                            () =>
+                                runner.run(dataset.scalars, dataset.points, {
+                                    verbose: false,
+                                }),
+                            rounds
+                        );
+                        result = timed.result;
+                        timingsMs = timed.timingsMs;
+                        medianMs = median(timingsMs);
+                        console.log(
+                            `GPU warm runs: ${timingsMs
+                                .map((ms) => ms.toFixed(2))
+                                .join(', ')} ms`
+                        );
+                        console.log(`GPU median warm run: ${medianMs.toFixed(2)} ms`);
+                    }
                     console.log(
                         `Warm result x: ${result.x.toString().slice(0, 24)}...`
                     );

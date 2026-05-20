@@ -124,3 +124,52 @@ export async function bundleTests(
 
     return outfile;
 }
+
+export async function bundleBrowserProving(
+    entryFile: string,
+    outDir = 'browser-proving',
+    htmlFile = 'browser-proving.html'
+) {
+    if (!fs.existsSync(PUBLIC_DIR))
+        fs.mkdirSync(PUBLIC_DIR, { recursive: true });
+
+    const outdir = path.resolve(PUBLIC_DIR, outDir);
+    fs.mkdirSync(outdir, { recursive: true });
+
+    await esbuild.build({
+        entryPoints: [entryFile],
+        bundle: true,
+        format: 'esm',
+        splitting: true,
+        outdir,
+        platform: 'browser',
+        external: ['o1js'],
+        define: { 'process.env.NODE_ENV': '"test"' },
+        loader: {
+            '.wgsl': 'text',
+        },
+    });
+
+    const htmlPath = path.resolve(PUBLIC_DIR, htmlFile);
+    const html = `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>Browser Proving</title>
+  <script type="importmap">
+    {
+      "imports": {
+        "o1js": "/o1js/index.js",
+        "tslib": "/vendor/tslib/tslib.es6.js"
+      }
+    }
+  </script>
+</head>
+<body>
+  <h1>Browser Proving</h1>
+  <div>Check console output for proving timings.</div>
+  <script type="module" src="/${outDir}/counter-browser.js"></script>
+</body>
+</html>`;
+    fs.writeFileSync(htmlPath, html, 'utf-8');
+}

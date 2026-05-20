@@ -168,6 +168,19 @@ This browser benchmark will report, for each dataset:
 - whether the CPU and GPU MSM results match
 - the `Speedup CPU/GPU cold` and `Speedup CPU/GPU warm median` ratios
 
+### Rollup Internal MSM Flow
+
+For the rollup `depositNew()` path, use:
+
+- **Capture real proving-time MSMs from `runRollup`**:  
+  `npm run capture:rollup-internal-msm`
+
+- **Summarize the captured dataset**:  
+  `npm run summarize:kimchi-msm -- public/datasets/rollup-internal-msm.json`
+
+- **Replay the rollup dataset in the browser MSM benchmark**:  
+  `npm run bench:browser-cli -- '?dataset=datasets/rollup-internal-msm.json&rounds=3'`
+
 ## Real Browser Proving
 
 To benchmark actual `o1js` proving in browser conditions, use the browser proving mode:

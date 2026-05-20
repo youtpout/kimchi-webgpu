@@ -5682,6 +5682,7 @@ async function pippengerMSMPallas(device, scalars, points, config2) {
 var PippengerMSMPallasRunner = class {
   constructor(device, bucketWidthBits) {
     this.batchFinalPointsCapacity = 0;
+    this.multiResultCapacity = 0;
     this.device = device;
     this.bucketWidthBits = bucketWidthBits;
     this.numberOfBuckets = 1 << bucketWidthBits;
@@ -5845,28 +5846,37 @@ var PippengerMSMPallasRunner = class {
       compute: { module: shaderModules.Horner, entryPoint: "main" }
     });
     const bBufferSize = this.numWindows * this.numberOfBuckets * BYTES_PER_ELEMENT_256;
-    this.bXBuffer = this.createBuffer(bBufferSize, GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC);
-    this.bYBuffer = this.createBuffer(bBufferSize, GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC);
-    this.bZBuffer = this.createBuffer(bBufferSize, GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC);
+    this.bXBuffer = this.createBuffer(
+      bBufferSize,
+      GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST
+    );
+    this.bYBuffer = this.createBuffer(
+      bBufferSize,
+      GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST
+    );
+    this.bZBuffer = this.createBuffer(
+      bBufferSize,
+      GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST
+    );
     this.fWindowsXBuffer = this.createBuffer(
       this.numWindows * BYTES_PER_ELEMENT_256,
-      GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC
+      GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST
     );
     this.fWindowsYBuffer = this.createBuffer(
       this.numWindows * BYTES_PER_ELEMENT_256,
-      GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC
+      GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST
     );
     this.fWindowsZBuffer = this.createBuffer(
       this.numWindows * BYTES_PER_ELEMENT_256,
-      GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC
+      GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST
     );
     this.finalPointXBuffer = this.createBuffer(
       BYTES_PER_ELEMENT_256,
-      GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC
+      GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST
     );
     this.finalPointYBuffer = this.createBuffer(
       BYTES_PER_ELEMENT_256,
-      GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC
+      GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST
     );
     this.finalPointXStagingBuffer = this.createBuffer(
       BYTES_PER_ELEMENT_256,
@@ -6005,22 +6015,13 @@ var PippengerMSMPallasRunner = class {
     });
   }
   async run(scalars, points, config2) {
-    const n = scalars.length;
-    if (n === 0) throw new Error("scalars and points arrays cannot be empty");
-    if (points.length !== n) throw new Error("scalars and points must have same length");
+    const [result] = await this.runMany([{ scalars, points }], config2);
+    return result;
+  }
+  async runMany(jobs, config2) {
+    if (jobs.length === 0) throw new Error("jobs array cannot be empty");
     const verbose = config2?.verbose ?? true;
-    const numBatches = Math.ceil(n / this.maxChunkN);
-    this.ensureBatchFinalPointsCapacity(numBatches);
-    if (verbose) {
-      console.log("=== Pippenger MSM Configuration ===");
-      console.log(`Total points:         ${n}`);
-      console.log(`Bucket width (bits):  ${this.bucketWidthBits}`);
-      console.log(`Number of buckets:    ${this.numberOfBuckets}`);
-      console.log(`Number of windows:    ${this.numWindows}`);
-      console.log(`Max points per batch: ${this.maxChunkN}`);
-      console.log(`Number of batches:    ${numBatches}`);
-      console.log("===================================");
-    }
+    this.ensureMultiResultCapacity(jobs.length);
     let passCountA = 0;
     let passCountBi1 = 0;
     let passCountBi2 = 0;
@@ -6029,177 +6030,170 @@ var PippengerMSMPallasRunner = class {
     let passCountHorner = 0;
     let passCountE = 0;
     let commandEncoder = this.device.createCommandEncoder();
-    this.clearReusableState(commandEncoder, numBatches);
-    this.device.queue.submit([commandEncoder.finish()]);
-    commandEncoder = this.device.createCommandEncoder();
-    for (let batchIdx = 0; batchIdx < numBatches; batchIdx++) {
-      const batchOffset = batchIdx * this.maxChunkN;
-      const currentBatchN = Math.min(n - batchOffset, this.maxChunkN);
+    for (let jobIdx = 0; jobIdx < jobs.length; jobIdx++) {
+      const { scalars, points } = jobs[jobIdx];
+      const n = scalars.length;
+      if (n === 0) throw new Error("scalars and points arrays cannot be empty");
+      if (points.length !== n) throw new Error("scalars and points must have same length");
+      const numBatches = Math.ceil(n / this.maxChunkN);
+      this.ensureBatchFinalPointsCapacity(numBatches);
+      this.clearReusableState(commandEncoder, numBatches);
+      this.device.queue.submit([commandEncoder.finish()]);
+      commandEncoder = this.device.createCommandEncoder();
       if (verbose) {
-        console.log(`Batch ${batchIdx + 1}/${numBatches} (${currentBatchN} points)`);
+        console.log("=== Pippenger MSM Configuration ===");
+        console.log(`Job:                  ${jobs[jobIdx].label ?? jobIdx}`);
+        console.log(`Total points:         ${n}`);
+        console.log(`Bucket width (bits):  ${this.bucketWidthBits}`);
+        console.log(`Number of buckets:    ${this.numberOfBuckets}`);
+        console.log(`Number of windows:    ${this.numWindows}`);
+        console.log(`Max points per batch: ${this.maxChunkN}`);
+        console.log(`Number of batches:    ${numBatches}`);
+        console.log("===================================");
       }
-      this.packBatchInputs(scalars, points, batchOffset, currentBatchN);
-      const usedHostLimbs = currentBatchN * LIMBS_PER_ELEMENT_256;
-      this.device.queue.writeBuffer(
-        this.kBuffer,
-        0,
-        this.kHost.buffer,
-        0,
-        usedHostLimbs * Uint32Array.BYTES_PER_ELEMENT
-      );
-      this.device.queue.writeBuffer(
-        this.pxBuffer,
-        0,
-        this.pxHost.buffer,
-        0,
-        usedHostLimbs * Uint32Array.BYTES_PER_ELEMENT
-      );
-      this.device.queue.writeBuffer(
-        this.pyBuffer,
-        0,
-        this.pyHost.buffer,
-        0,
-        usedHostLimbs * Uint32Array.BYTES_PER_ELEMENT
-      );
-      this.device.queue.writeBuffer(this.passANUniform, 0, new Uint32Array([currentBatchN]));
-      {
-        const numWG = Math.ceil(currentBatchN / WORKGROUP_SIZE_A);
-        const pass = commandEncoder.beginComputePass();
-        pass.setPipeline(this.pipelineA);
-        pass.setBindGroup(0, this.bindGroupPassA);
-        pass.dispatchWorkgroups(numWG);
-        pass.end();
-        passCountA++;
-      }
-      const numWorkgroupsBi1 = Math.ceil(currentBatchN / WORKGROUP_SIZE_BI1);
-      for (let windowIdx = 0; windowIdx < this.numWindows; windowIdx++) {
-        this.device.queue.writeBuffer(this.bi1WindowIdxBuffer, 0, new Uint32Array([windowIdx]));
-        for (let bucketValue = 1; bucketValue < this.numberOfBuckets; bucketValue++) {
-          this.device.queue.writeBuffer(this.bucketIdxUniform, 0, new Uint32Array([bucketValue]));
-          {
-            const pass = commandEncoder.beginComputePass();
-            pass.setPipeline(this.pipelineBi1);
-            pass.setBindGroup(0, this.bindGroupBi1Params);
-            pass.setBindGroup(1, this.bindGroupBucketIdx);
-            pass.setBindGroup(2, this.bindGroupPassBi1Input);
-            pass.setBindGroup(3, this.bindGroupWGG);
-            pass.dispatchWorkgroups(numWorkgroupsBi1);
-            pass.end();
-            passCountBi1++;
+      for (let batchIdx = 0; batchIdx < numBatches; batchIdx++) {
+        const batchOffset = batchIdx * this.maxChunkN;
+        const currentBatchN = Math.min(n - batchOffset, this.maxChunkN);
+        if (verbose) {
+          console.log(`Job ${jobIdx + 1}/${jobs.length} batch ${batchIdx + 1}/${numBatches} (${currentBatchN} points)`);
+        }
+        this.packBatchInputs(scalars, points, batchOffset, currentBatchN);
+        const usedHostLimbs = currentBatchN * LIMBS_PER_ELEMENT_256;
+        this.device.queue.writeBuffer(this.kBuffer, 0, this.kHost.buffer, 0, usedHostLimbs * Uint32Array.BYTES_PER_ELEMENT);
+        this.device.queue.writeBuffer(this.pxBuffer, 0, this.pxHost.buffer, 0, usedHostLimbs * Uint32Array.BYTES_PER_ELEMENT);
+        this.device.queue.writeBuffer(this.pyBuffer, 0, this.pyHost.buffer, 0, usedHostLimbs * Uint32Array.BYTES_PER_ELEMENT);
+        this.device.queue.writeBuffer(this.passANUniform, 0, new Uint32Array([currentBatchN]));
+        {
+          const numWG = Math.ceil(currentBatchN / WORKGROUP_SIZE_A);
+          const pass = commandEncoder.beginComputePass();
+          pass.setPipeline(this.pipelineA);
+          pass.setBindGroup(0, this.bindGroupPassA);
+          pass.dispatchWorkgroups(numWG);
+          pass.end();
+          passCountA++;
+        }
+        const numWorkgroupsBi1 = Math.ceil(currentBatchN / WORKGROUP_SIZE_BI1);
+        for (let windowIdx = 0; windowIdx < this.numWindows; windowIdx++) {
+          this.device.queue.writeBuffer(this.bi1WindowIdxBuffer, 0, new Uint32Array([windowIdx]));
+          for (let bucketValue = 1; bucketValue < this.numberOfBuckets; bucketValue++) {
+            this.device.queue.writeBuffer(this.bucketIdxUniform, 0, new Uint32Array([bucketValue]));
+            {
+              const pass = commandEncoder.beginComputePass();
+              pass.setPipeline(this.pipelineBi1);
+              pass.setBindGroup(0, this.bindGroupBi1Params);
+              pass.setBindGroup(1, this.bindGroupBucketIdx);
+              pass.setBindGroup(2, this.bindGroupPassBi1Input);
+              pass.setBindGroup(3, this.bindGroupWGG);
+              pass.dispatchWorkgroups(numWorkgroupsBi1);
+              pass.end();
+              passCountBi1++;
+            }
+            let currentNBi2 = numWorkgroupsBi1;
+            while (currentNBi2 >= 1) {
+              this.device.queue.writeBuffer(this.bi2UniformsBuffer, 0, new Uint32Array([currentNBi2, windowIdx, this.numberOfBuckets, 0]));
+              const numWG = Math.ceil(currentNBi2 / WORKGROUP_SIZE_BI2);
+              const pass = commandEncoder.beginComputePass();
+              pass.setPipeline(this.pipelineBi2);
+              pass.setBindGroup(0, this.bindGroupBi2Uniforms);
+              pass.setBindGroup(1, this.bindGroupBucketIdx);
+              pass.setBindGroup(2, this.bindGroupWGG);
+              pass.setBindGroup(3, this.bindGroupBucketsStorage);
+              pass.dispatchWorkgroups(numWG);
+              pass.end();
+              passCountBi2++;
+              if (currentNBi2 <= WORKGROUP_SIZE_BI2) break;
+              currentNBi2 = Math.ceil(currentNBi2 / WORKGROUP_SIZE_BI2);
+            }
+            this.device.queue.submit([commandEncoder.finish()]);
+            commandEncoder = this.device.createCommandEncoder();
           }
-          let currentNBi2 = numWorkgroupsBi1;
-          while (currentNBi2 >= 1) {
-            this.device.queue.writeBuffer(
-              this.bi2UniformsBuffer,
-              0,
-              new Uint32Array([currentNBi2, windowIdx, this.numberOfBuckets, 0])
-            );
-            const numWG = Math.ceil(currentNBi2 / WORKGROUP_SIZE_BI2);
+          this.device.queue.writeBuffer(this.cUniformsBuffer, 0, new Uint32Array([windowIdx, this.numberOfBuckets]));
+          {
+            const numWG = Math.ceil(this.numberOfBuckets / WORKGROUP_SIZE_C);
             const pass = commandEncoder.beginComputePass();
-            pass.setPipeline(this.pipelineBi2);
-            pass.setBindGroup(0, this.bindGroupBi2Uniforms);
-            pass.setBindGroup(1, this.bindGroupBucketIdx);
-            pass.setBindGroup(2, this.bindGroupWGG);
-            pass.setBindGroup(3, this.bindGroupBucketsStorage);
+            pass.setPipeline(this.pipelineC);
+            pass.setBindGroup(0, this.bindGroupCUniforms);
+            pass.setBindGroup(1, this.bindGroupBucketsStorage);
+            pass.setBindGroup(2, this.bindGroupFStorage);
             pass.dispatchWorkgroups(numWG);
             pass.end();
-            passCountBi2++;
-            if (currentNBi2 <= WORKGROUP_SIZE_BI2) {
-              break;
-            }
-            currentNBi2 = Math.ceil(currentNBi2 / WORKGROUP_SIZE_BI2);
+            passCountC++;
+          }
+          let currentND = this.maxNumWorkgroupsC;
+          while (currentND >= 1) {
+            this.device.queue.writeBuffer(this.passDNUniform, 0, new Uint32Array([currentND]));
+            this.device.queue.writeBuffer(this.passDBatchIdxUniform, 0, new Uint32Array([windowIdx]));
+            const numWG = Math.ceil(currentND / WORKGROUP_SIZE_D);
+            const pass = commandEncoder.beginComputePass();
+            pass.setPipeline(this.pipelineD);
+            pass.setBindGroup(0, this.bindGroupPassDUniforms);
+            pass.setBindGroup(1, this.bindGroupFStorage);
+            pass.setBindGroup(2, this.bindGroupFWindowsOutput);
+            pass.dispatchWorkgroups(numWG);
+            pass.end();
+            passCountD++;
+            if (currentND <= WORKGROUP_SIZE_D) break;
+            currentND = Math.ceil(currentND / WORKGROUP_SIZE_D);
           }
           this.device.queue.submit([commandEncoder.finish()]);
           commandEncoder = this.device.createCommandEncoder();
         }
-        this.device.queue.writeBuffer(
-          this.cUniformsBuffer,
-          0,
-          new Uint32Array([windowIdx, this.numberOfBuckets])
-        );
+        this.device.queue.writeBuffer(this.hornerUniformsBuffer, 0, new Uint32Array([this.numWindows, this.bucketWidthBits, batchIdx, 0]));
         {
-          const numWG = Math.ceil(this.numberOfBuckets / WORKGROUP_SIZE_C);
           const pass = commandEncoder.beginComputePass();
-          pass.setPipeline(this.pipelineC);
-          pass.setBindGroup(0, this.bindGroupCUniforms);
-          pass.setBindGroup(1, this.bindGroupBucketsStorage);
-          pass.setBindGroup(2, this.bindGroupFStorage);
-          pass.dispatchWorkgroups(numWG);
+          pass.setPipeline(this.pipelineHorner);
+          pass.setBindGroup(0, this.bindGroupHornerUniforms);
+          pass.setBindGroup(1, this.bindGroupFWindowsInput);
+          pass.setBindGroup(2, this.bindGroupBatchFinalPoints);
+          pass.dispatchWorkgroups(1);
           pass.end();
-          passCountC++;
-        }
-        let currentND = this.maxNumWorkgroupsC;
-        while (currentND >= 1) {
-          this.device.queue.writeBuffer(this.passDNUniform, 0, new Uint32Array([currentND]));
-          this.device.queue.writeBuffer(
-            this.passDBatchIdxUniform,
-            0,
-            new Uint32Array([windowIdx])
-          );
-          const numWG = Math.ceil(currentND / WORKGROUP_SIZE_D);
-          const pass = commandEncoder.beginComputePass();
-          pass.setPipeline(this.pipelineD);
-          pass.setBindGroup(0, this.bindGroupPassDUniforms);
-          pass.setBindGroup(1, this.bindGroupFStorage);
-          pass.setBindGroup(2, this.bindGroupFWindowsOutput);
-          pass.dispatchWorkgroups(numWG);
-          pass.end();
-          passCountD++;
-          if (currentND <= WORKGROUP_SIZE_D) {
-            break;
-          }
-          currentND = Math.ceil(currentND / WORKGROUP_SIZE_D);
+          passCountHorner++;
         }
         this.device.queue.submit([commandEncoder.finish()]);
         commandEncoder = this.device.createCommandEncoder();
       }
-      this.device.queue.writeBuffer(
-        this.hornerUniformsBuffer,
-        0,
-        new Uint32Array([this.numWindows, this.bucketWidthBits, batchIdx, 0])
-      );
-      {
+      let currentNE = numBatches;
+      while (currentNE >= 1) {
+        this.device.queue.writeBuffer(this.passENUniform, 0, new Uint32Array([currentNE]));
         const pass = commandEncoder.beginComputePass();
-        pass.setPipeline(this.pipelineHorner);
-        pass.setBindGroup(0, this.bindGroupHornerUniforms);
-        pass.setBindGroup(1, this.bindGroupFWindowsInput);
-        pass.setBindGroup(2, this.bindGroupBatchFinalPoints);
-        pass.dispatchWorkgroups(1);
+        pass.setPipeline(this.pipelineE);
+        pass.setBindGroup(0, this.bindGroupPassEN);
+        pass.setBindGroup(1, this.bindGroupBatchFinalPoints);
+        pass.setBindGroup(2, this.bindGroupFinalPoint);
+        pass.dispatchWorkgroups(Math.ceil(currentNE / WORKGROUP_SIZE_E));
         pass.end();
-        passCountHorner++;
+        passCountE++;
+        if (currentNE <= WORKGROUP_SIZE_E) break;
+        currentNE = Math.ceil(currentNE / WORKGROUP_SIZE_E);
       }
-      this.device.queue.submit([commandEncoder.finish()]);
-      commandEncoder = this.device.createCommandEncoder();
-    }
-    let currentNE = numBatches;
-    while (currentNE >= 1) {
-      this.device.queue.writeBuffer(this.passENUniform, 0, new Uint32Array([currentNE]));
-      const pass = commandEncoder.beginComputePass();
-      pass.setPipeline(this.pipelineE);
-      pass.setBindGroup(0, this.bindGroupPassEN);
-      pass.setBindGroup(1, this.bindGroupBatchFinalPoints);
-      pass.setBindGroup(2, this.bindGroupFinalPoint);
-      pass.dispatchWorkgroups(Math.ceil(currentNE / WORKGROUP_SIZE_E));
-      pass.end();
-      passCountE++;
-      if (currentNE <= WORKGROUP_SIZE_E) {
-        break;
-      }
-      currentNE = Math.ceil(currentNE / WORKGROUP_SIZE_E);
+      commandEncoder.copyBufferToBuffer(
+        this.finalPointXBuffer,
+        0,
+        this.multiResultXBuffer,
+        jobIdx * BYTES_PER_ELEMENT_256,
+        BYTES_PER_ELEMENT_256
+      );
+      commandEncoder.copyBufferToBuffer(
+        this.finalPointYBuffer,
+        0,
+        this.multiResultYBuffer,
+        jobIdx * BYTES_PER_ELEMENT_256,
+        BYTES_PER_ELEMENT_256
+      );
     }
     commandEncoder.copyBufferToBuffer(
-      this.finalPointXBuffer,
+      this.multiResultXBuffer,
       0,
-      this.finalPointXStagingBuffer,
+      this.multiResultXStagingBuffer,
       0,
-      BYTES_PER_ELEMENT_256
+      jobs.length * BYTES_PER_ELEMENT_256
     );
     commandEncoder.copyBufferToBuffer(
-      this.finalPointYBuffer,
+      this.multiResultYBuffer,
       0,
-      this.finalPointYStagingBuffer,
+      this.multiResultYStagingBuffer,
       0,
-      BYTES_PER_ELEMENT_256
+      jobs.length * BYTES_PER_ELEMENT_256
     );
     if (verbose) {
       console.log("\n--- Dispatches per Stage ---");
@@ -6217,13 +6211,21 @@ var PippengerMSMPallasRunner = class {
     }
     this.device.queue.submit([commandEncoder.finish()]);
     await this.device.queue.onSubmittedWorkDone();
-    await this.finalPointXStagingBuffer.mapAsync(GPUMapMode.READ);
-    await this.finalPointYStagingBuffer.mapAsync(GPUMapMode.READ);
-    const xView = new Uint32Array(this.finalPointXStagingBuffer.getMappedRange()).slice();
-    const yView = new Uint32Array(this.finalPointYStagingBuffer.getMappedRange()).slice();
-    this.finalPointXStagingBuffer.unmap();
-    this.finalPointYStagingBuffer.unmap();
-    return { x: limbs256ToBigint(xView), y: limbs256ToBigint(yView) };
+    await this.multiResultXStagingBuffer.mapAsync(GPUMapMode.READ);
+    await this.multiResultYStagingBuffer.mapAsync(GPUMapMode.READ);
+    const xView = new Uint32Array(this.multiResultXStagingBuffer.getMappedRange()).slice();
+    const yView = new Uint32Array(this.multiResultYStagingBuffer.getMappedRange()).slice();
+    this.multiResultXStagingBuffer.unmap();
+    this.multiResultYStagingBuffer.unmap();
+    const results = [];
+    for (let jobIdx = 0; jobIdx < jobs.length; jobIdx++) {
+      const offset = jobIdx * LIMBS_PER_ELEMENT_256;
+      results.push({
+        x: limbs256ToBigint(xView.subarray(offset, offset + LIMBS_PER_ELEMENT_256)),
+        y: limbs256ToBigint(yView.subarray(offset, offset + LIMBS_PER_ELEMENT_256))
+      });
+    }
+    return results;
   }
   destroy() {
     this.batchFinalPointsXBuffer?.destroy();
@@ -6252,15 +6254,15 @@ var PippengerMSMPallasRunner = class {
     );
     this.batchFinalPointsXBuffer = this.createBuffer(
       batchFinalPointsSize,
-      GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC
+      GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST
     );
     this.batchFinalPointsYBuffer = this.createBuffer(
       batchFinalPointsSize,
-      GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC
+      GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST
     );
     this.batchFinalPointsZBuffer = this.createBuffer(
       batchFinalPointsSize,
-      GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC
+      GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST
     );
     this.bindGroupBatchFinalPoints = this.device.createBindGroup({
       layout: this.layoutBatchFinalPoints,
@@ -6271,6 +6273,19 @@ var PippengerMSMPallasRunner = class {
       ]
     });
     this.batchFinalPointsCapacity = numBatches;
+  }
+  ensureMultiResultCapacity(numJobs) {
+    if (numJobs <= this.multiResultCapacity) return;
+    this.multiResultXBuffer?.destroy();
+    this.multiResultYBuffer?.destroy();
+    this.multiResultXStagingBuffer?.destroy();
+    this.multiResultYStagingBuffer?.destroy();
+    const size = Math.max(numJobs * BYTES_PER_ELEMENT_256, BYTES_PER_ELEMENT_256);
+    this.multiResultXBuffer = this.createBuffer(size, GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST);
+    this.multiResultYBuffer = this.createBuffer(size, GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST);
+    this.multiResultXStagingBuffer = this.createBuffer(size, GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST);
+    this.multiResultYStagingBuffer = this.createBuffer(size, GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST);
+    this.multiResultCapacity = numJobs;
   }
   clearReusableState(commandEncoder, numBatches) {
     const batchBytes = Math.max(numBatches * BYTES_PER_ELEMENT_256, BYTES_PER_ELEMENT_256);
@@ -7134,6 +7149,7 @@ async function pippengerMSMVesta(device, scalars, points, config2) {
 var PippengerMSMVestaRunner = class {
   constructor(device, bucketWidthBits) {
     this.batchFinalPointsCapacity = 0;
+    this.multiResultCapacity = 0;
     this.device = device;
     this.bucketWidthBits = bucketWidthBits;
     this.numberOfBuckets = 1 << bucketWidthBits;
@@ -7297,28 +7313,37 @@ var PippengerMSMVestaRunner = class {
       compute: { module: shaderModules.Horner, entryPoint: "main" }
     });
     const bBufferSize = this.numWindows * this.numberOfBuckets * BYTES_PER_ELEMENT_256;
-    this.bXBuffer = this.createBuffer(bBufferSize, GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC);
-    this.bYBuffer = this.createBuffer(bBufferSize, GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC);
-    this.bZBuffer = this.createBuffer(bBufferSize, GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC);
+    this.bXBuffer = this.createBuffer(
+      bBufferSize,
+      GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST
+    );
+    this.bYBuffer = this.createBuffer(
+      bBufferSize,
+      GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST
+    );
+    this.bZBuffer = this.createBuffer(
+      bBufferSize,
+      GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST
+    );
     this.fWindowsXBuffer = this.createBuffer(
       this.numWindows * BYTES_PER_ELEMENT_256,
-      GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC
+      GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST
     );
     this.fWindowsYBuffer = this.createBuffer(
       this.numWindows * BYTES_PER_ELEMENT_256,
-      GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC
+      GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST
     );
     this.fWindowsZBuffer = this.createBuffer(
       this.numWindows * BYTES_PER_ELEMENT_256,
-      GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC
+      GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST
     );
     this.finalPointXBuffer = this.createBuffer(
       BYTES_PER_ELEMENT_256,
-      GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC
+      GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST
     );
     this.finalPointYBuffer = this.createBuffer(
       BYTES_PER_ELEMENT_256,
-      GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC
+      GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST
     );
     this.finalPointXStagingBuffer = this.createBuffer(
       BYTES_PER_ELEMENT_256,
@@ -7457,22 +7482,13 @@ var PippengerMSMVestaRunner = class {
     });
   }
   async run(scalars, points, config2) {
-    const n = scalars.length;
-    if (n === 0) throw new Error("scalars and points arrays cannot be empty");
-    if (points.length !== n) throw new Error("scalars and points must have same length");
+    const [result] = await this.runMany([{ scalars, points }], config2);
+    return result;
+  }
+  async runMany(jobs, config2) {
+    if (jobs.length === 0) throw new Error("jobs array cannot be empty");
     const verbose = config2?.verbose ?? true;
-    const numBatches = Math.ceil(n / this.maxChunkN);
-    this.ensureBatchFinalPointsCapacity(numBatches);
-    if (verbose) {
-      console.log("=== Pippenger MSM Configuration ===");
-      console.log(`Total points:         ${n}`);
-      console.log(`Bucket width (bits):  ${this.bucketWidthBits}`);
-      console.log(`Number of buckets:    ${this.numberOfBuckets}`);
-      console.log(`Number of windows:    ${this.numWindows}`);
-      console.log(`Max points per batch: ${this.maxChunkN}`);
-      console.log(`Number of batches:    ${numBatches}`);
-      console.log("===================================");
-    }
+    this.ensureMultiResultCapacity(jobs.length);
     let passCountA = 0;
     let passCountBi1 = 0;
     let passCountBi2 = 0;
@@ -7481,178 +7497,147 @@ var PippengerMSMVestaRunner = class {
     let passCountHorner = 0;
     let passCountE = 0;
     let commandEncoder = this.device.createCommandEncoder();
-    this.clearReusableState(commandEncoder, numBatches);
-    this.device.queue.submit([commandEncoder.finish()]);
-    commandEncoder = this.device.createCommandEncoder();
-    for (let batchIdx = 0; batchIdx < numBatches; batchIdx++) {
-      const batchOffset = batchIdx * this.maxChunkN;
-      const currentBatchN = Math.min(n - batchOffset, this.maxChunkN);
+    for (let jobIdx = 0; jobIdx < jobs.length; jobIdx++) {
+      const { scalars, points } = jobs[jobIdx];
+      const n = scalars.length;
+      if (n === 0) throw new Error("scalars and points arrays cannot be empty");
+      if (points.length !== n) throw new Error("scalars and points must have same length");
+      const numBatches = Math.ceil(n / this.maxChunkN);
+      this.ensureBatchFinalPointsCapacity(numBatches);
+      this.clearReusableState(commandEncoder, numBatches);
+      this.device.queue.submit([commandEncoder.finish()]);
+      commandEncoder = this.device.createCommandEncoder();
       if (verbose) {
-        console.log(`Batch ${batchIdx + 1}/${numBatches} (${currentBatchN} points)`);
+        console.log("=== Pippenger MSM Configuration ===");
+        console.log(`Job:                  ${jobs[jobIdx].label ?? jobIdx}`);
+        console.log(`Total points:         ${n}`);
+        console.log(`Bucket width (bits):  ${this.bucketWidthBits}`);
+        console.log(`Number of buckets:    ${this.numberOfBuckets}`);
+        console.log(`Number of windows:    ${this.numWindows}`);
+        console.log(`Max points per batch: ${this.maxChunkN}`);
+        console.log(`Number of batches:    ${numBatches}`);
+        console.log("===================================");
       }
-      this.packBatchInputs(scalars, points, batchOffset, currentBatchN);
-      const usedHostLimbs = currentBatchN * LIMBS_PER_ELEMENT_256;
-      this.device.queue.writeBuffer(
-        this.kBuffer,
-        0,
-        this.kHost.buffer,
-        0,
-        usedHostLimbs * Uint32Array.BYTES_PER_ELEMENT
-      );
-      this.device.queue.writeBuffer(
-        this.pxBuffer,
-        0,
-        this.pxHost.buffer,
-        0,
-        usedHostLimbs * Uint32Array.BYTES_PER_ELEMENT
-      );
-      this.device.queue.writeBuffer(
-        this.pyBuffer,
-        0,
-        this.pyHost.buffer,
-        0,
-        usedHostLimbs * Uint32Array.BYTES_PER_ELEMENT
-      );
-      this.device.queue.writeBuffer(this.passANUniform, 0, new Uint32Array([currentBatchN]));
-      {
-        const numWG = Math.ceil(currentBatchN / WORKGROUP_SIZE_A2);
-        const pass = commandEncoder.beginComputePass();
-        pass.setPipeline(this.pipelineA);
-        pass.setBindGroup(0, this.bindGroupPassA);
-        pass.dispatchWorkgroups(numWG);
-        pass.end();
-        passCountA++;
-      }
-      const numWorkgroupsBi1 = Math.ceil(currentBatchN / WORKGROUP_SIZE_BI12);
-      for (let windowIdx = 0; windowIdx < this.numWindows; windowIdx++) {
-        this.device.queue.writeBuffer(this.bi1WindowIdxBuffer, 0, new Uint32Array([windowIdx]));
-        for (let bucketValue = 1; bucketValue < this.numberOfBuckets; bucketValue++) {
-          this.device.queue.writeBuffer(this.bucketIdxUniform, 0, new Uint32Array([bucketValue]));
-          {
-            const pass = commandEncoder.beginComputePass();
-            pass.setPipeline(this.pipelineBi1);
-            pass.setBindGroup(0, this.bindGroupBi1Params);
-            pass.setBindGroup(1, this.bindGroupBucketIdx);
-            pass.setBindGroup(2, this.bindGroupPassBi1Input);
-            pass.setBindGroup(3, this.bindGroupWGG);
-            pass.dispatchWorkgroups(numWorkgroupsBi1);
-            pass.end();
-            passCountBi1++;
+      for (let batchIdx = 0; batchIdx < numBatches; batchIdx++) {
+        const batchOffset = batchIdx * this.maxChunkN;
+        const currentBatchN = Math.min(n - batchOffset, this.maxChunkN);
+        if (verbose) {
+          console.log(`Job ${jobIdx + 1}/${jobs.length} batch ${batchIdx + 1}/${numBatches} (${currentBatchN} points)`);
+        }
+        this.packBatchInputs(scalars, points, batchOffset, currentBatchN);
+        const usedHostLimbs = currentBatchN * LIMBS_PER_ELEMENT_256;
+        this.device.queue.writeBuffer(this.kBuffer, 0, this.kHost.buffer, 0, usedHostLimbs * Uint32Array.BYTES_PER_ELEMENT);
+        this.device.queue.writeBuffer(this.pxBuffer, 0, this.pxHost.buffer, 0, usedHostLimbs * Uint32Array.BYTES_PER_ELEMENT);
+        this.device.queue.writeBuffer(this.pyBuffer, 0, this.pyHost.buffer, 0, usedHostLimbs * Uint32Array.BYTES_PER_ELEMENT);
+        this.device.queue.writeBuffer(this.passANUniform, 0, new Uint32Array([currentBatchN]));
+        {
+          const numWG = Math.ceil(currentBatchN / WORKGROUP_SIZE_A2);
+          const pass = commandEncoder.beginComputePass();
+          pass.setPipeline(this.pipelineA);
+          pass.setBindGroup(0, this.bindGroupPassA);
+          pass.dispatchWorkgroups(numWG);
+          pass.end();
+          passCountA++;
+        }
+        const numWorkgroupsBi1 = Math.ceil(currentBatchN / WORKGROUP_SIZE_BI12);
+        for (let windowIdx = 0; windowIdx < this.numWindows; windowIdx++) {
+          this.device.queue.writeBuffer(this.bi1WindowIdxBuffer, 0, new Uint32Array([windowIdx]));
+          for (let bucketValue = 1; bucketValue < this.numberOfBuckets; bucketValue++) {
+            this.device.queue.writeBuffer(this.bucketIdxUniform, 0, new Uint32Array([bucketValue]));
+            {
+              const pass = commandEncoder.beginComputePass();
+              pass.setPipeline(this.pipelineBi1);
+              pass.setBindGroup(0, this.bindGroupBi1Params);
+              pass.setBindGroup(1, this.bindGroupBucketIdx);
+              pass.setBindGroup(2, this.bindGroupPassBi1Input);
+              pass.setBindGroup(3, this.bindGroupWGG);
+              pass.dispatchWorkgroups(numWorkgroupsBi1);
+              pass.end();
+              passCountBi1++;
+            }
+            let currentNBi2 = numWorkgroupsBi1;
+            while (currentNBi2 >= 1) {
+              this.device.queue.writeBuffer(this.bi2UniformsBuffer, 0, new Uint32Array([currentNBi2, windowIdx, this.numberOfBuckets, 0]));
+              const numWG = Math.ceil(currentNBi2 / WORKGROUP_SIZE_BI22);
+              const pass = commandEncoder.beginComputePass();
+              pass.setPipeline(this.pipelineBi2);
+              pass.setBindGroup(0, this.bindGroupBi2Uniforms);
+              pass.setBindGroup(1, this.bindGroupBucketIdx);
+              pass.setBindGroup(2, this.bindGroupWGG);
+              pass.setBindGroup(3, this.bindGroupBucketsStorage);
+              pass.dispatchWorkgroups(numWG);
+              pass.end();
+              passCountBi2++;
+              if (currentNBi2 <= WORKGROUP_SIZE_BI22) break;
+              currentNBi2 = Math.ceil(currentNBi2 / WORKGROUP_SIZE_BI22);
+            }
+            this.device.queue.submit([commandEncoder.finish()]);
+            commandEncoder = this.device.createCommandEncoder();
           }
-          let currentNBi2 = numWorkgroupsBi1;
-          while (currentNBi2 >= 1) {
-            this.device.queue.writeBuffer(
-              this.bi2UniformsBuffer,
-              0,
-              new Uint32Array([currentNBi2, windowIdx, this.numberOfBuckets, 0])
-            );
-            const numWG = Math.ceil(currentNBi2 / WORKGROUP_SIZE_BI22);
+          this.device.queue.writeBuffer(this.cUniformsBuffer, 0, new Uint32Array([windowIdx, this.numberOfBuckets]));
+          {
+            const numWG = Math.ceil(this.numberOfBuckets / WORKGROUP_SIZE_C2);
             const pass = commandEncoder.beginComputePass();
-            pass.setPipeline(this.pipelineBi2);
-            pass.setBindGroup(0, this.bindGroupBi2Uniforms);
-            pass.setBindGroup(1, this.bindGroupBucketIdx);
-            pass.setBindGroup(2, this.bindGroupWGG);
-            pass.setBindGroup(3, this.bindGroupBucketsStorage);
+            pass.setPipeline(this.pipelineC);
+            pass.setBindGroup(0, this.bindGroupCUniforms);
+            pass.setBindGroup(1, this.bindGroupBucketsStorage);
+            pass.setBindGroup(2, this.bindGroupFStorage);
             pass.dispatchWorkgroups(numWG);
             pass.end();
-            passCountBi2++;
-            if (currentNBi2 <= WORKGROUP_SIZE_BI22) {
-              break;
-            }
-            currentNBi2 = Math.ceil(currentNBi2 / WORKGROUP_SIZE_BI22);
+            passCountC++;
+          }
+          let currentND = this.maxNumWorkgroupsC;
+          while (currentND >= 1) {
+            this.device.queue.writeBuffer(this.passDNUniform, 0, new Uint32Array([currentND]));
+            this.device.queue.writeBuffer(this.passDBatchIdxUniform, 0, new Uint32Array([windowIdx]));
+            const numWG = Math.ceil(currentND / WORKGROUP_SIZE_D2);
+            const pass = commandEncoder.beginComputePass();
+            pass.setPipeline(this.pipelineD);
+            pass.setBindGroup(0, this.bindGroupPassDUniforms);
+            pass.setBindGroup(1, this.bindGroupFStorage);
+            pass.setBindGroup(2, this.bindGroupFWindowsOutput);
+            pass.dispatchWorkgroups(numWG);
+            pass.end();
+            passCountD++;
+            if (currentND <= WORKGROUP_SIZE_D2) break;
+            currentND = Math.ceil(currentND / WORKGROUP_SIZE_D2);
           }
           this.device.queue.submit([commandEncoder.finish()]);
           commandEncoder = this.device.createCommandEncoder();
         }
-        this.device.queue.writeBuffer(
-          this.cUniformsBuffer,
-          0,
-          new Uint32Array([windowIdx, this.numberOfBuckets])
-        );
+        this.device.queue.writeBuffer(this.hornerUniformsBuffer, 0, new Uint32Array([this.numWindows, this.bucketWidthBits, batchIdx, 0]));
         {
-          const numWG = Math.ceil(this.numberOfBuckets / WORKGROUP_SIZE_C2);
           const pass = commandEncoder.beginComputePass();
-          pass.setPipeline(this.pipelineC);
-          pass.setBindGroup(0, this.bindGroupCUniforms);
-          pass.setBindGroup(1, this.bindGroupBucketsStorage);
-          pass.setBindGroup(2, this.bindGroupFStorage);
-          pass.dispatchWorkgroups(numWG);
+          pass.setPipeline(this.pipelineHorner);
+          pass.setBindGroup(0, this.bindGroupHornerUniforms);
+          pass.setBindGroup(1, this.bindGroupFWindowsInput);
+          pass.setBindGroup(2, this.bindGroupBatchFinalPoints);
+          pass.dispatchWorkgroups(1);
           pass.end();
-          passCountC++;
-        }
-        let currentND = this.maxNumWorkgroupsC;
-        while (currentND >= 1) {
-          this.device.queue.writeBuffer(this.passDNUniform, 0, new Uint32Array([currentND]));
-          this.device.queue.writeBuffer(
-            this.passDBatchIdxUniform,
-            0,
-            new Uint32Array([windowIdx])
-          );
-          const numWG = Math.ceil(currentND / WORKGROUP_SIZE_D2);
-          const pass = commandEncoder.beginComputePass();
-          pass.setPipeline(this.pipelineD);
-          pass.setBindGroup(0, this.bindGroupPassDUniforms);
-          pass.setBindGroup(1, this.bindGroupFStorage);
-          pass.setBindGroup(2, this.bindGroupFWindowsOutput);
-          pass.dispatchWorkgroups(numWG);
-          pass.end();
-          passCountD++;
-          if (currentND <= WORKGROUP_SIZE_D2) {
-            break;
-          }
-          currentND = Math.ceil(currentND / WORKGROUP_SIZE_D2);
+          passCountHorner++;
         }
         this.device.queue.submit([commandEncoder.finish()]);
         commandEncoder = this.device.createCommandEncoder();
       }
-      this.device.queue.writeBuffer(
-        this.hornerUniformsBuffer,
-        0,
-        new Uint32Array([this.numWindows, this.bucketWidthBits, batchIdx, 0])
-      );
-      {
+      let currentNE = numBatches;
+      while (currentNE >= 1) {
+        this.device.queue.writeBuffer(this.passENUniform, 0, new Uint32Array([currentNE]));
         const pass = commandEncoder.beginComputePass();
-        pass.setPipeline(this.pipelineHorner);
-        pass.setBindGroup(0, this.bindGroupHornerUniforms);
-        pass.setBindGroup(1, this.bindGroupFWindowsInput);
-        pass.setBindGroup(2, this.bindGroupBatchFinalPoints);
-        pass.dispatchWorkgroups(1);
+        pass.setPipeline(this.pipelineE);
+        pass.setBindGroup(0, this.bindGroupPassEN);
+        pass.setBindGroup(1, this.bindGroupBatchFinalPoints);
+        pass.setBindGroup(2, this.bindGroupFinalPoint);
+        pass.dispatchWorkgroups(Math.ceil(currentNE / WORKGROUP_SIZE_E2));
         pass.end();
-        passCountHorner++;
+        passCountE++;
+        if (currentNE <= WORKGROUP_SIZE_E2) break;
+        currentNE = Math.ceil(currentNE / WORKGROUP_SIZE_E2);
       }
-      this.device.queue.submit([commandEncoder.finish()]);
-      commandEncoder = this.device.createCommandEncoder();
+      commandEncoder.copyBufferToBuffer(this.finalPointXBuffer, 0, this.multiResultXBuffer, jobIdx * BYTES_PER_ELEMENT_256, BYTES_PER_ELEMENT_256);
+      commandEncoder.copyBufferToBuffer(this.finalPointYBuffer, 0, this.multiResultYBuffer, jobIdx * BYTES_PER_ELEMENT_256, BYTES_PER_ELEMENT_256);
     }
-    let currentNE = numBatches;
-    while (currentNE >= 1) {
-      this.device.queue.writeBuffer(this.passENUniform, 0, new Uint32Array([currentNE]));
-      const pass = commandEncoder.beginComputePass();
-      pass.setPipeline(this.pipelineE);
-      pass.setBindGroup(0, this.bindGroupPassEN);
-      pass.setBindGroup(1, this.bindGroupBatchFinalPoints);
-      pass.setBindGroup(2, this.bindGroupFinalPoint);
-      pass.dispatchWorkgroups(Math.ceil(currentNE / WORKGROUP_SIZE_E2));
-      pass.end();
-      passCountE++;
-      if (currentNE <= WORKGROUP_SIZE_E2) {
-        break;
-      }
-      currentNE = Math.ceil(currentNE / WORKGROUP_SIZE_E2);
-    }
-    commandEncoder.copyBufferToBuffer(
-      this.finalPointXBuffer,
-      0,
-      this.finalPointXStagingBuffer,
-      0,
-      BYTES_PER_ELEMENT_256
-    );
-    commandEncoder.copyBufferToBuffer(
-      this.finalPointYBuffer,
-      0,
-      this.finalPointYStagingBuffer,
-      0,
-      BYTES_PER_ELEMENT_256
-    );
+    commandEncoder.copyBufferToBuffer(this.multiResultXBuffer, 0, this.multiResultXStagingBuffer, 0, jobs.length * BYTES_PER_ELEMENT_256);
+    commandEncoder.copyBufferToBuffer(this.multiResultYBuffer, 0, this.multiResultYStagingBuffer, 0, jobs.length * BYTES_PER_ELEMENT_256);
     if (verbose) {
       console.log("\n--- Dispatches per Stage ---");
       console.log(`Pass A:      ${passCountA}`);
@@ -7669,13 +7654,21 @@ var PippengerMSMVestaRunner = class {
     }
     this.device.queue.submit([commandEncoder.finish()]);
     await this.device.queue.onSubmittedWorkDone();
-    await this.finalPointXStagingBuffer.mapAsync(GPUMapMode.READ);
-    await this.finalPointYStagingBuffer.mapAsync(GPUMapMode.READ);
-    const xView = new Uint32Array(this.finalPointXStagingBuffer.getMappedRange()).slice();
-    const yView = new Uint32Array(this.finalPointYStagingBuffer.getMappedRange()).slice();
-    this.finalPointXStagingBuffer.unmap();
-    this.finalPointYStagingBuffer.unmap();
-    return { x: limbs256ToBigint(xView), y: limbs256ToBigint(yView) };
+    await this.multiResultXStagingBuffer.mapAsync(GPUMapMode.READ);
+    await this.multiResultYStagingBuffer.mapAsync(GPUMapMode.READ);
+    const xView = new Uint32Array(this.multiResultXStagingBuffer.getMappedRange()).slice();
+    const yView = new Uint32Array(this.multiResultYStagingBuffer.getMappedRange()).slice();
+    this.multiResultXStagingBuffer.unmap();
+    this.multiResultYStagingBuffer.unmap();
+    const results = [];
+    for (let jobIdx = 0; jobIdx < jobs.length; jobIdx++) {
+      const offset = jobIdx * LIMBS_PER_ELEMENT_256;
+      results.push({
+        x: limbs256ToBigint(xView.subarray(offset, offset + LIMBS_PER_ELEMENT_256)),
+        y: limbs256ToBigint(yView.subarray(offset, offset + LIMBS_PER_ELEMENT_256))
+      });
+    }
+    return results;
   }
   destroy() {
     this.batchFinalPointsXBuffer?.destroy();
@@ -7704,15 +7697,15 @@ var PippengerMSMVestaRunner = class {
     );
     this.batchFinalPointsXBuffer = this.createBuffer(
       batchFinalPointsSize,
-      GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC
+      GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST
     );
     this.batchFinalPointsYBuffer = this.createBuffer(
       batchFinalPointsSize,
-      GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC
+      GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST
     );
     this.batchFinalPointsZBuffer = this.createBuffer(
       batchFinalPointsSize,
-      GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC
+      GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST
     );
     this.bindGroupBatchFinalPoints = this.device.createBindGroup({
       layout: this.layoutBatchFinalPoints,
@@ -7723,6 +7716,19 @@ var PippengerMSMVestaRunner = class {
       ]
     });
     this.batchFinalPointsCapacity = numBatches;
+  }
+  ensureMultiResultCapacity(numJobs) {
+    if (numJobs <= this.multiResultCapacity) return;
+    this.multiResultXBuffer?.destroy();
+    this.multiResultYBuffer?.destroy();
+    this.multiResultXStagingBuffer?.destroy();
+    this.multiResultYStagingBuffer?.destroy();
+    const size = Math.max(numJobs * BYTES_PER_ELEMENT_256, BYTES_PER_ELEMENT_256);
+    this.multiResultXBuffer = this.createBuffer(size, GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST);
+    this.multiResultYBuffer = this.createBuffer(size, GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST);
+    this.multiResultXStagingBuffer = this.createBuffer(size, GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST);
+    this.multiResultYStagingBuffer = this.createBuffer(size, GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST);
+    this.multiResultCapacity = numJobs;
   }
   clearReusableState(commandEncoder, numBatches) {
     const batchBytes = Math.max(numBatches * BYTES_PER_ELEMENT_256, BYTES_PER_ELEMENT_256);
@@ -7905,6 +7911,51 @@ async function runTimed(run, rounds) {
 function createRunner(device, curve) {
   return curve === "pallas" ? createPippengerMSMPallasRunner(device, { bucketWidthBits: 8 }) : createPippengerMSMVestaRunner(device, { bucketWidthBits: 8 });
 }
+async function runWarmBatch(device, datasets, rounds) {
+  const pallasRunner = createPippengerMSMPallasRunner(device, {
+    bucketWidthBits: 8
+  });
+  const vestaRunner = createPippengerMSMVestaRunner(device, {
+    bucketWidthBits: 8
+  });
+  const pallasJobs = datasets.filter((dataset) => dataset.curve === "pallas").map((dataset) => ({
+    label: dataset.label,
+    scalars: dataset.scalars,
+    points: dataset.points
+  }));
+  const vestaJobs = datasets.filter((dataset) => dataset.curve === "vesta").map((dataset) => ({
+    label: dataset.label,
+    scalars: dataset.scalars,
+    points: dataset.points
+  }));
+  if (pallasJobs.length > 0) {
+    await pallasRunner.runMany(pallasJobs, { verbose: false });
+  }
+  if (vestaJobs.length > 0) {
+    await vestaRunner.runMany(vestaJobs, { verbose: false });
+  }
+  const timingsMs = [];
+  let lastResults = /* @__PURE__ */ new Map();
+  for (let round = 0; round < rounds; round++) {
+    const start = performance.now();
+    const roundResults = /* @__PURE__ */ new Map();
+    if (pallasJobs.length > 0) {
+      const results = await pallasRunner.runMany(pallasJobs, { verbose: false });
+      for (let i = 0; i < pallasJobs.length; i++) {
+        roundResults.set(pallasJobs[i].label ?? `pallas-${i}`, results[i]);
+      }
+    }
+    if (vestaJobs.length > 0) {
+      const results = await vestaRunner.runMany(vestaJobs, { verbose: false });
+      for (let i = 0; i < vestaJobs.length; i++) {
+        roundResults.set(vestaJobs[i].label ?? `vesta-${i}`, results[i]);
+      }
+    }
+    timingsMs.push(performance.now() - start);
+    lastResults = roundResults;
+  }
+  return { timingsMs, results: lastResults };
+}
 async function runCold(device, curve, scalars, points) {
   return curve === "pallas" ? pippengerMSMPallas(device, scalars, points, {
     bucketWidthBits: 8,
@@ -7927,6 +7978,7 @@ if (requestedDataset) {
         const params = new URLSearchParams(window.location.search);
         const roundsParam = params.get("rounds");
         const rounds = roundsParam ? Number.parseInt(roundsParam, 10) : 3;
+        const batchMsms = params.get("batchMsms") === "1";
         const cpuMaxNParam = params.get("cpuMaxN");
         const cpuMaxN = cpuMaxNParam ? Number.parseInt(cpuMaxNParam, 10) : 4096;
         const cpuBenchmarkFile = await fetchCpuBenchmarkFile();
@@ -7934,6 +7986,27 @@ if (requestedDataset) {
           (cpuBenchmarkFile?.results ?? []).map((entry) => [entry.label, entry])
         );
         const device = await getDevice2();
+        const batchedWarmResults = batchMsms ? await runWarmBatch(
+          device,
+          datasetFile.datasets.map((dataset) => ({
+            label: dataset.label,
+            curve: dataset.curve,
+            scalars: dataset.scalars,
+            points: dataset.points
+          })),
+          rounds
+        ) : null;
+        if (batchMsms && batchedWarmResults) {
+          console.log("");
+          console.log(
+            `[batched-msm] warm batch runs: ${batchedWarmResults.timingsMs.map((ms) => ms.toFixed(2)).join(", ")} ms`
+          );
+          console.log(
+            `[batched-msm] warm batch median: ${median2(
+              batchedWarmResults.timingsMs
+            ).toFixed(2)} ms`
+          );
+        }
         for (const dataset of datasetFile.datasets) {
           console.log("");
           console.log(`=== Dataset: ${dataset.label} ===`);
@@ -7984,21 +8057,42 @@ if (requestedDataset) {
           console.log(
             `Cold result x: ${coldResult.x.toString().slice(0, 24)}...`
           );
-          const runner = createRunner(device, dataset.curve);
-          await runner.run(dataset.scalars, dataset.points, {
-            verbose: false
-          });
-          const { result, timingsMs } = await runTimed(
-            () => runner.run(dataset.scalars, dataset.points, {
+          let result;
+          let timingsMs;
+          let medianMs;
+          if (batchMsms && batchedWarmResults) {
+            const batchedResult = batchedWarmResults.results.get(dataset.label);
+            if (!batchedResult) {
+              throw new Error(`Missing batched result for dataset ${dataset.label}`);
+            }
+            result = batchedResult;
+            timingsMs = batchedWarmResults.timingsMs;
+            medianMs = median2(timingsMs);
+            console.log(
+              `GPU warm runs (batched): ${timingsMs.map((ms) => ms.toFixed(2)).join(", ")} ms`
+            );
+            console.log(
+              `GPU median warm run (batched): ${medianMs.toFixed(2)} ms`
+            );
+          } else {
+            const runner = createRunner(device, dataset.curve);
+            await runner.run(dataset.scalars, dataset.points, {
               verbose: false
-            }),
-            rounds
-          );
-          const medianMs = median2(timingsMs);
-          console.log(
-            `GPU warm runs: ${timingsMs.map((ms) => ms.toFixed(2)).join(", ")} ms`
-          );
-          console.log(`GPU median warm run: ${medianMs.toFixed(2)} ms`);
+            });
+            const timed = await runTimed(
+              () => runner.run(dataset.scalars, dataset.points, {
+                verbose: false
+              }),
+              rounds
+            );
+            result = timed.result;
+            timingsMs = timed.timingsMs;
+            medianMs = median2(timingsMs);
+            console.log(
+              `GPU warm runs: ${timingsMs.map((ms) => ms.toFixed(2)).join(", ")} ms`
+            );
+            console.log(`GPU median warm run: ${medianMs.toFixed(2)} ms`);
+          }
           console.log(
             `Warm result x: ${result.x.toString().slice(0, 24)}...`
           );
@@ -8719,63 +8813,6 @@ if (requestedArtifact) {
         }
       },
       18e5
-    );
-  });
-}
-
-// src/benchmarks/o1js_browser_proving.spec.ts
-function median4(values) {
-  const sorted = [...values].sort((a, b) => a - b);
-  const mid = Math.floor(sorted.length / 2);
-  return sorted.length % 2 === 0 ? (sorted[mid - 1] + sorted[mid]) / 2 : sorted[mid];
-}
-async function timeRun(run) {
-  const startMs = performance.now();
-  const result = await run();
-  return { result, elapsedMs: performance.now() - startMs };
-}
-var browserProving = new URLSearchParams(window.location.search).get("browserProving");
-if (browserProving === "counter") {
-  describe("Browser o1js proving", () => {
-    it(
-      "runs the real counter proving flow in the browser",
-      async () => {
-        const params = new URLSearchParams(window.location.search);
-        const roundsParam = params.get("rounds");
-        const rounds = roundsParam ? Number.parseInt(roundsParam, 10) : 1;
-        if (!Number.isFinite(rounds) || rounds < 1) {
-          throw new Error(`Invalid rounds parameter: ${roundsParam}`);
-        }
-        console.log(`[browser-proving] target=counter rounds=${rounds}`);
-        const harnessModulePath = "/dist/src/proof/runCounterProof.js";
-        const { createCounterProofHarness } = await import(harnessModulePath);
-        const setup = await timeRun(async () => createCounterProofHarness());
-        console.log(
-          `[browser-proving] setup_total_ms=${setup.elapsedMs.toFixed(2)}`
-        );
-        const cold = await timeRun(async () => setup.result.proveIncrement());
-        console.log(
-          `[browser-proving] cold_prove_ms=${cold.elapsedMs.toFixed(2)} final_counter=${cold.result.finalCounter}`
-        );
-        const warmTimingsMs = [];
-        let lastFinalCounter = cold.result.finalCounter;
-        for (let i = 0; i < rounds; i++) {
-          const warm = await timeRun(async () => setup.result.proveIncrement());
-          warmTimingsMs.push(warm.elapsedMs);
-          lastFinalCounter = warm.result.finalCounter;
-          console.log(
-            `[browser-proving] warm_prove_round=${i + 1} elapsed_ms=${warm.elapsedMs.toFixed(2)} final_counter=${warm.result.finalCounter}`
-          );
-        }
-        console.log(
-          `[browser-proving] warm_prove_runs_ms=${warmTimingsMs.map((value) => value.toFixed(2)).join(", ")}`
-        );
-        console.log(
-          `[browser-proving] warm_prove_median_ms=${median4(warmTimingsMs).toFixed(2)}`
-        );
-        expect(lastFinalCounter).to.equal("0");
-      },
-      Infinity
     );
   });
 }

@@ -15,11 +15,13 @@
         "capture:kimchi-msm": "npm run build && node dist/src/tools/exportKimchiCommitmentMsms.js",
         "capture:kimchi-proof": "npm run build && node dist/src/tools/exportKimchiCommitmentMsms.js",
         "capture:kimchi-internal-msm": "npm run build && node dist/src/tools/exportKimchiInternalMsms.js",
+        "capture:rollup-internal-msm": "npm run build && node dist/src/tools/exportKimchiInternalMsms.js ./dist/src/proof/runRollup.js public/datasets/rollup-internal-msm.json",
         "bench:kimchi-cpu-msm": "npm run build && node dist/src/tools/benchmarkKimchiCpuMsms.js",
         "cache:o1js-embedded": "npm run build && node dist/src/tools/generateEmbeddedO1jsCache.js",
         "probe:kimchi-runtime": "npm run build && node dist/src/tools/probeKimchiRuntimeCalls.js",
         "inspect:kimchi-proof": "npm run build && node dist/src/tools/inspectKimchiProofArtifacts.js",
-        "convert:kimchi-proof-msm": "npm run build && node dist/src/tools/convertKimchiProofArtifactsToMsm.js"
+        "convert:kimchi-proof-msm": "npm run build && node dist/src/tools/convertKimchiProofArtifactsToMsm.js",
+        "summarize:kimchi-msm": "npm run build && node dist/src/tools/summarizeKimchiMsmDataset.js"
     },
     "keywords": [
         "Kimchi",

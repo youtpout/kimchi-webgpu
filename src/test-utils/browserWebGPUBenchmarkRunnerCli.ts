@@ -1,5 +1,6 @@
 import {
     bundleTests,
+    bundleBrowserProving,
     findBrave,
     startServer,
     ROOT_DIR,
@@ -34,6 +35,12 @@ async function main() {
             'bundle.benchmarks.js',
             'index.benchmarks.html'
         );
+    } else {
+        const entryFile = path.resolve(
+            ROOT_DIR,
+            'dist/src/browser-proving/counter-browser.js'
+        );
+        await bundleBrowserProving(entryFile);
     }
     const { url: baseUrl } = await startServer();
     const benchmarkBaseUrl = browserProvingMode

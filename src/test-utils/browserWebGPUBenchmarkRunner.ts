@@ -1,4 +1,10 @@
-import { bundleTests, findBrave, startServer, ROOT_DIR } from './browserTestRunnerUtils.js';
+import {
+  bundleBrowserProving,
+  bundleTests,
+  findBrave,
+  startServer,
+  ROOT_DIR,
+} from './browserTestRunnerUtils.js';
 import path from 'path';
 import { spawn } from 'child_process';
 
@@ -14,6 +20,12 @@ async function main() {
       'bundle.benchmarks.js',
       'index.benchmarks.html'
     );
+  } else {
+    const entryFile = path.resolve(
+      ROOT_DIR,
+      'dist/src/browser-proving/counter-browser.js'
+    );
+    await bundleBrowserProving(entryFile);
   }
   const { url: baseUrl } = await startServer();
   const benchmarkBaseUrl = browserProvingMode
