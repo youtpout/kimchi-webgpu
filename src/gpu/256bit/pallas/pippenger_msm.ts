@@ -146,9 +146,9 @@ export class PippengerMSMPallasRunner {
 
     private readonly bindGroupPassA: GPUBindGroup;
     private readonly bindGroupBi1Params: GPUBindGroup;
-    private readonly bindGroupBucketIdx: GPUBindGroup;
     private readonly bindGroupPassBi1Input: GPUBindGroup;
     private readonly bindGroupWGG: GPUBindGroup;
+    private readonly bindGroupBucketIdx: GPUBindGroup;
     private readonly bindGroupBi2Uniforms: GPUBindGroup;
     private readonly bindGroupBucketsStorage: GPUBindGroup;
     private readonly bindGroupCUniforms: GPUBindGroup;
@@ -631,7 +631,6 @@ export class PippengerMSMPallasRunner {
 
                 for (let windowIdx = 0; windowIdx < this.numWindows; windowIdx++) {
                     this.device.queue.writeBuffer(this.bi1WindowIdxBuffer, 0, new Uint32Array([windowIdx]));
-
                     for (let bucketValue = 1; bucketValue < this.numberOfBuckets; bucketValue++) {
                         this.device.queue.writeBuffer(this.bucketIdxUniform, 0, new Uint32Array([bucketValue]));
 

@@ -216,6 +216,9 @@ if (requestedDataset) {
                 const roundsParam = params.get('rounds');
                 const rounds = roundsParam ? Number.parseInt(roundsParam, 10) : 3;
                 const batchMsms = params.get('batchMsms') === '1';
+                const limitParam = params.get('limit');
+                const limit = limitParam ? Number.parseInt(limitParam, 10) : null;
+                const labelFilter = params.get('label');
                 const cpuBenchmarkFile = await fetchCpuBenchmarkFile();
                 if (!cpuBenchmarkFile) {
                     throw new Error(
@@ -226,10 +229,28 @@ if (requestedDataset) {
                     cpuBenchmarkFile.results.map((entry) => [entry.label, entry])
                 );
                 const device = await getDevice();
+                const selectedDatasets = datasetFile.datasets
+                    .filter((dataset) =>
+                        labelFilter ? dataset.label.includes(labelFilter) : true
+                    )
+                    .slice(0, limit ?? undefined);
+
+                if (selectedDatasets.length === 0) {
+                    throw new Error(
+                        `No datasets selected for replay (label=${labelFilter ?? '*'}, limit=${limit ?? 'all'})`
+                    );
+                }
+
+                console.log(
+                    `[dataset-replay] selected=${selectedDatasets.length}/${datasetFile.datasets.length}` +
+                        (labelFilter ? ` label~=${labelFilter}` : '') +
+                        (limit !== null ? ` limit=${limit}` : '')
+                );
+
                 const batchedWarmResults = batchMsms
                     ? await runWarmBatch(
                           device,
-                          datasetFile.datasets.map((dataset) => ({
+                          selectedDatasets.map((dataset) => ({
                               label: dataset.label,
                               curve: dataset.curve,
                               scalars: dataset.scalars,
@@ -258,7 +279,7 @@ if (requestedDataset) {
                 let totalGpuColdMs = 0;
                 let totalGpuWarmMedianMs = 0;
 
-                for (const dataset of datasetFile.datasets) {
+                for (const dataset of selectedDatasets) {
                     console.log('');
                     console.log(`=== Dataset: ${dataset.label} ===`);
                     console.log(`Source: ${dataset.source}`);

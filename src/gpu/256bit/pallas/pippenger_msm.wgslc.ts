@@ -643,9 +643,7 @@ struct Bi2Uniforms {
     number_of_buckets: u32, // NUMBER_OF_BUCKETS = 1 << BUCKET_WIDTH_BITS
 }
 @group(0) @binding(0) var<uniform> bi2: Bi2Uniforms;
-
 @group(1) @binding(0) var<uniform> bucket_idx: u32;
-
 @group(2) @binding(0) var<storage, read_write> WGGx: array<Limbs256>;
 @group(2) @binding(1) var<storage, read_write> WGGy: array<Limbs256>;
 @group(2) @binding(2) var<storage, read_write> WGGz: array<Limbs256>;

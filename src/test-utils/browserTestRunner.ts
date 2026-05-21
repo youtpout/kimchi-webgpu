@@ -113,6 +113,17 @@ function withTimeout<T>(
     });
 }
 
+function serializeError(err: unknown) {
+    if (err instanceof Error) {
+        return {
+            name: err.name,
+            message: err.message,
+            stack: err.stack ?? null,
+        };
+    }
+    return err;
+}
+
 // === Custom Console Logging Integration ===
 
 const originalConsole = console;
@@ -289,14 +300,17 @@ async function runSuite(
         } catch (err) {
             const testEnd = performance.now();
             const duration = (testEnd - testStart).toFixed(2);
+            const serializedError = serializeError(err);
 
             originalConsole.error(
                 `${prefix}❌ ${t.name} (${duration} ms)`,
-                err
+                serializedError
             );
 
             const titleEl = document.createElement('div');
-            titleEl.textContent = `❌ Failed in (${duration} ms): ${err}`; // ${t.name}
+            titleEl.textContent = `❌ Failed in (${duration} ms): ${
+                err instanceof Error ? err.message : String(err)
+            }`; // ${t.name}
             titleEl.style.margin = '5px 0 7px 20px';
             titleEl.style.color = '#e57373'; // red
             testEl.appendChild(titleEl);
