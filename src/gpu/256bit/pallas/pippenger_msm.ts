@@ -22,12 +22,15 @@ const WORKGROUP_SIZE_C = 64;
 const WORKGROUP_SIZE_D = 64;
 const WORKGROUP_SIZE_E = 64;
 const SCALAR_BITS = 256;
+const MAX_POINTS_PER_SINGLE_BI2_PASS =
+    WORKGROUP_SIZE_BI1 * WORKGROUP_SIZE_BI2;
 
 const runnerCache = new WeakMap<GPUDevice, Map<number, PippengerMSMPallasRunner>>();
 
 export interface PippengerMSMConfig {
     bucketWidthBits?: number;
     verbose?: boolean;
+    debugDumpWindows?: boolean;
 }
 
 export interface PippengerMSMJob {
@@ -181,7 +184,8 @@ export class PippengerMSMPallasRunner {
         const maxWorkgroups = 65535;
         this.maxChunkN = Math.min(
             Math.floor(maxBufferSize / BYTES_PER_ELEMENT_256),
-            maxWorkgroups * WORKGROUP_SIZE_BI1
+            maxWorkgroups * WORKGROUP_SIZE_BI1,
+            MAX_POINTS_PER_SINGLE_BI2_PASS
         );
         this.maxNumWorkgroupsBi1 = Math.ceil(this.maxChunkN / WORKGROUP_SIZE_BI1);
         this.maxNumWorkgroupsC = Math.ceil(this.numberOfBuckets / WORKGROUP_SIZE_C);
@@ -565,6 +569,7 @@ export class PippengerMSMPallasRunner {
         if (jobs.length === 0) throw new Error('jobs array cannot be empty');
 
         const verbose = config?.verbose ?? true;
+        const debugDumpWindows = config?.debugDumpWindows ?? false;
         this.ensureMultiResultCapacity(jobs.length);
 
         let passCountA = 0;
@@ -703,6 +708,15 @@ export class PippengerMSMPallasRunner {
                     }
 
                     this.device.queue.submit([commandEncoder.finish()]);
+                    commandEncoder = this.device.createCommandEncoder();
+                }
+
+                if (debugDumpWindows && jobs.length === 1) {
+                    this.device.queue.submit([commandEncoder.finish()]);
+                    await this.device.queue.onSubmittedWorkDone();
+                    await this.logWindowProjectives(
+                        `job=${jobs[jobIdx].label ?? jobIdx} batch=${batchIdx}`
+                    );
                     commandEncoder = this.device.createCommandEncoder();
                 }
 
@@ -907,6 +921,70 @@ export class PippengerMSMPallasRunner {
         commandEncoder.clearBuffer(this.batchFinalPointsZBuffer, 0, batchBytes);
         commandEncoder.clearBuffer(this.finalPointXBuffer);
         commandEncoder.clearBuffer(this.finalPointYBuffer);
+    }
+
+    private async logWindowProjectives(prefix: string): Promise<void> {
+        const size = this.numWindows * BYTES_PER_ELEMENT_256;
+        const stageX = this.createBuffer(size, GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST);
+        const stageY = this.createBuffer(size, GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST);
+        const stageZ = this.createBuffer(size, GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST);
+
+        const encoder = this.device.createCommandEncoder();
+        encoder.copyBufferToBuffer(this.fWindowsXBuffer, 0, stageX, 0, size);
+        encoder.copyBufferToBuffer(this.fWindowsYBuffer, 0, stageY, 0, size);
+        encoder.copyBufferToBuffer(this.fWindowsZBuffer, 0, stageZ, 0, size);
+        this.device.queue.submit([encoder.finish()]);
+        await this.device.queue.onSubmittedWorkDone();
+
+        await Promise.all([
+            stageX.mapAsync(GPUMapMode.READ),
+            stageY.mapAsync(GPUMapMode.READ),
+            stageZ.mapAsync(GPUMapMode.READ),
+        ]);
+
+        const xView = new Uint32Array(stageX.getMappedRange()).slice();
+        const yView = new Uint32Array(stageY.getMappedRange()).slice();
+        const zView = new Uint32Array(stageZ.getMappedRange()).slice();
+
+        stageX.unmap();
+        stageY.unmap();
+        stageZ.unmap();
+
+        const preview: string[] = [];
+        let nonZeroWindows = 0;
+        for (let windowIdx = 0; windowIdx < this.numWindows; windowIdx++) {
+            const offset = windowIdx * LIMBS_PER_ELEMENT_256;
+            const x = limbs256ToBigint(
+                xView.subarray(offset, offset + LIMBS_PER_ELEMENT_256)
+            );
+            const y = limbs256ToBigint(
+                yView.subarray(offset, offset + LIMBS_PER_ELEMENT_256)
+            );
+            const z = limbs256ToBigint(
+                zView.subarray(offset, offset + LIMBS_PER_ELEMENT_256)
+            );
+            if (x !== 0n || y !== 0n || z !== 0n) {
+                nonZeroWindows++;
+            }
+            if (windowIdx < 6 || windowIdx >= this.numWindows - 2) {
+                preview.push(
+                    `w${windowIdx}:x=${x.toString().slice(0, 18)} y=${y
+                        .toString()
+                        .slice(0, 18)} z=${z.toString().slice(0, 18)}`
+                );
+            }
+        }
+
+        console.log(
+            `[pallas-window-debug] ${prefix} nonZeroWindows=${nonZeroWindows}/${this.numWindows}`
+        );
+        for (const line of preview) {
+            console.log(`[pallas-window-debug] ${line}`);
+        }
+
+        stageX.destroy();
+        stageY.destroy();
+        stageZ.destroy();
     }
 
     private createBuffer(size: number, usage: GPUBufferUsageFlags): GPUBuffer {

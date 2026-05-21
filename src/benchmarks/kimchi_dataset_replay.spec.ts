@@ -109,7 +109,7 @@ function createRunner(
     run: (
         scalars: bigint[],
         points: Point[],
-        config?: { verbose?: boolean }
+        config?: { verbose?: boolean; debugDumpWindows?: boolean }
     ) => Promise<Point>;
 } {
     return curve === 'pallas'
@@ -187,16 +187,19 @@ async function runCold(
     device: GPUDevice,
     curve: 'pallas' | 'vesta',
     scalars: bigint[],
-    points: Point[]
+    points: Point[],
+    verbose: boolean,
+    debugDumpWindows = false
 ): Promise<Point> {
     return curve === 'pallas'
         ? pippengerMSMPallas(device, scalars, points, {
               bucketWidthBits: 8,
-              verbose: false,
+              verbose,
+              debugDumpWindows,
           })
         : pippengerMSMVesta(device, scalars, points, {
               bucketWidthBits: 8,
-              verbose: false,
+              verbose,
           });
 }
 
@@ -216,6 +219,9 @@ if (requestedDataset) {
                 const roundsParam = params.get('rounds');
                 const rounds = roundsParam ? Number.parseInt(roundsParam, 10) : 3;
                 const batchMsms = params.get('batchMsms') === '1';
+                const gpuVerbose = params.get('gpuVerbose') === '1';
+                const debugDumpWindows = params.get('debugDumpWindows') === '1';
+                const compareRunMany = params.get('compareRunMany') === '1';
                 const limitParam = params.get('limit');
                 const limit = limitParam ? Number.parseInt(limitParam, 10) : null;
                 const labelFilter = params.get('label');
@@ -315,7 +321,9 @@ if (requestedDataset) {
                         device,
                         dataset.curve,
                         dataset.scalars,
-                        dataset.points
+                        dataset.points,
+                        gpuVerbose,
+                        debugDumpWindows
                     );
                     const coldMs = performance.now() - coldStart;
 
@@ -347,14 +355,43 @@ if (requestedDataset) {
                         );
                     } else {
                         const runner = createRunner(device, dataset.curve);
+                        if (compareRunMany && dataset.curve === 'pallas' && 'runMany' in runner) {
+                            const singleRun = await runner.run(
+                                dataset.scalars,
+                                dataset.points,
+                                {
+                                    verbose: gpuVerbose,
+                                    debugDumpWindows,
+                                }
+                            );
+                            const singleRunMany = await runner.runMany!(
+                                [
+                                    {
+                                        label: dataset.label,
+                                        scalars: dataset.scalars,
+                                        points: dataset.points,
+                                    },
+                                ],
+                                { verbose: gpuVerbose }
+                            );
+                            const runManyResult = singleRunMany[0];
+                            const same =
+                                singleRun.x === runManyResult.x &&
+                                singleRun.y === runManyResult.y;
+                            console.log(
+                                `[compare-runmany] label=${dataset.label} same=${same} run.x=${singleRun.x} runMany.x=${runManyResult.x}`
+                            );
+                        }
                         await runner.run(dataset.scalars, dataset.points, {
-                            verbose: false,
+                            verbose: gpuVerbose,
+                            debugDumpWindows,
                         });
 
                         const timed = await runTimed(
                             () =>
                                 runner.run(dataset.scalars, dataset.points, {
-                                    verbose: false,
+                                    verbose: gpuVerbose,
+                                    debugDumpWindows,
                                 }),
                             rounds
                         );

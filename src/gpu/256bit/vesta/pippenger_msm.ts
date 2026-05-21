@@ -22,6 +22,8 @@ const WORKGROUP_SIZE_C = 64;
 const WORKGROUP_SIZE_D = 64;
 const WORKGROUP_SIZE_E = 64;
 const SCALAR_BITS = 256;
+const MAX_POINTS_PER_SINGLE_BI2_PASS =
+    WORKGROUP_SIZE_BI1 * WORKGROUP_SIZE_BI2;
 
 const runnerCache = new WeakMap<GPUDevice, Map<number, PippengerMSMVestaRunner>>();
 
@@ -181,7 +183,8 @@ export class PippengerMSMVestaRunner {
         const maxWorkgroups = 65535;
         this.maxChunkN = Math.min(
             Math.floor(maxBufferSize / BYTES_PER_ELEMENT_256),
-            maxWorkgroups * WORKGROUP_SIZE_BI1
+            maxWorkgroups * WORKGROUP_SIZE_BI1,
+            MAX_POINTS_PER_SINGLE_BI2_PASS
         );
         this.maxNumWorkgroupsBi1 = Math.ceil(this.maxChunkN / WORKGROUP_SIZE_BI1);
         this.maxNumWorkgroupsC = Math.ceil(this.numberOfBuckets / WORKGROUP_SIZE_C);
