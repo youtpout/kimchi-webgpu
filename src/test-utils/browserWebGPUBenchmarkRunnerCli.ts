@@ -23,6 +23,14 @@ const linuxArgs = [
 
 const macArgs = ['--enable-features=Metal,WebGPU', '--use-angle=metal'];
 
+function shouldSuppressBrowserLog(args: unknown[]) {
+    const firstArg = args[0];
+    return (
+        typeof firstArg === 'string' &&
+        (firstArg.startsWith('[o1js gpu-proving'))
+    );
+}
+
 async function main() {
     const extraQuery = process.argv[2] ?? '';
     const browserProvingMode = new URLSearchParams(
@@ -81,6 +89,10 @@ async function main() {
             (args.length === 1 &&
                 (args[0] === '' || args[0] === null || args[0] === undefined))
         ) {
+            return;
+        }
+
+        if (shouldSuppressBrowserLog(args)) {
             return;
         }
 
