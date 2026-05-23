@@ -27,7 +27,7 @@ import {
 } from './rollup.js';
 
 setBackend('wasm');
-setNumberOfWorkers(0);
+//setNumberOfWorkers(0);
 
 const OP_WITHDRAW = Field(3);
 
