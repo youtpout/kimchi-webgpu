@@ -1,6 +1,10 @@
 async function main() {
     const params = new URLSearchParams(window.location.search);
-    const target = params.get('browserProving') ?? 'counter';
+    const requestedTarget = params.get('browserProving') ?? 'counter';
+    const target =
+        requestedTarget === 'rollup-deposit-new'
+            ? 'rollup-deposit'
+            : requestedTarget;
     const roundsParam = params.get('rounds');
     const rounds = roundsParam ? Number.parseInt(roundsParam, 10) : 1;
 
@@ -75,14 +79,22 @@ async function main() {
                 `[browser-proving] warm_prove_round=${i + 1} elapsed_ms=${warm.elapsedMs.toFixed(2)} ${lastSummary}`
             );
         }
-    } else if (target === 'rollup-deposit-new') {
+    } else if (target === 'rollup-deposit') {
         const { createVaultRollupProofHarness } = await import('../proof/runRollup.js');
-        const amount = params.get('amount') ?? '1000000000';
+        const bootstrapAmount = params.get('bootstrapAmount') ?? '1000000000';
+        const amount = params.get('amount') ?? '500000000';
 
         const setup = await timeRun(async () => createVaultRollupProofHarness());
         console.log(`[browser-proving] setup_total_ms=${setup.elapsedMs.toFixed(2)}`);
 
-        const cold = await timeRun(async () => setup.result.proveDepositNew(amount));
+        const bootstrap = await timeRun(async () =>
+            setup.result.proveDepositNew(bootstrapAmount)
+        );
+        console.log(
+            `[browser-proving] bootstrap_ms=${bootstrap.elapsedMs.toFixed(2)} initial_root=${bootstrap.result.initialRoot} new_root=${bootstrap.result.newRoot}`
+        );
+
+        const cold = await timeRun(async () => setup.result.proveDeposit(amount));
         lastSummary = `initial_root=${cold.result.initialRoot} new_root=${cold.result.newRoot}`;
         console.log(
             `[browser-proving] cold_prove_ms=${cold.elapsedMs.toFixed(2)} ${lastSummary}`
@@ -105,9 +117,27 @@ async function main() {
             console.log(
                 `[browser-proving] warm_setup_round=${i + 1} elapsed_ms=${warm.elapsedMs.toFixed(2)}`
             );
+            let warmBootstrap;
+            try {
+                warmBootstrap = await timeRun(async () =>
+                    warm.result.proveDepositNew(bootstrapAmount)
+                );
+            } catch (error) {
+                console.error(
+                    '[browser-proving] warm_bootstrap_failed',
+                    JSON.stringify({
+                        round: i + 1,
+                        ...formatError(error),
+                    })
+                );
+                throw error;
+            }
+            console.log(
+                `[browser-proving] warm_bootstrap_round=${i + 1} elapsed_ms=${warmBootstrap.elapsedMs.toFixed(2)} initial_root=${warmBootstrap.result.initialRoot} new_root=${warmBootstrap.result.newRoot}`
+            );
             let prove;
             try {
-                prove = await timeRun(async () => warm.result.proveDepositNew(amount));
+                prove = await timeRun(async () => warm.result.proveDeposit(amount));
             } catch (error) {
                 console.error(
                     '[browser-proving] warm_prove_failed',
