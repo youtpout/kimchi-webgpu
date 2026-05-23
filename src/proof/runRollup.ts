@@ -2,13 +2,13 @@ import {
     Field,
     getGpuMsmRunner,
     getGpuProver,
-    MerkleTree,
+    MerkleMap,
+    MerkleMapWitness,
     PrivateKey,
     PublicKey,
     setBackend,
     setGpuMsmRunner,
     setGpuProver,
-    setNumberOfWorkers,
     Signature,
     UInt64,
 } from 'o1js';
@@ -20,17 +20,15 @@ import { createWebGpuBatchedMsmRunner } from './webgpuMsmBatcher.js';
 
 import {
     AccountLeaf,
-    BALANCES_TREE_HEIGHT,
-    BalanceWitness,
+    deriveAccountKey,
     MinaVaultRollup,
     MinaVaultRollupProof,
-    VaultState,
+    OP_WITHDRAW,
+    TOTALS_KEY,
+    VaultTotalsLeaf,
 } from './rollup.js';
 
 setBackend('wasm');
-//setNumberOfWorkers(0);
-
-const OP_WITHDRAW = Field(3);
 
 export interface RootTransition {
     initialRoot: string;
@@ -38,7 +36,7 @@ export interface RootTransition {
 }
 
 export interface VaultRollupProofHarness {
-    tree: MerkleTree;
+    balances: MerkleMap;
     ownerKey: PrivateKey;
     owner: PublicKey;
 
@@ -58,16 +56,16 @@ export interface VaultRollupHarnessOptions {
 }
 
 type LocalAccountState = {
-    index: bigint;
+    key: Field;
     owner: PublicKey;
-    key: PrivateKey;
+    privateKey: PrivateKey;
     leaf: AccountLeaf;
 };
 
 type InternalProofResult = {
     proof: MinaVaultRollupProof;
-    initialState: VaultState;
-    newState: VaultState;
+    initialRoot: Field;
+    newRoot: Field;
 };
 
 function nowMs() {
@@ -87,8 +85,8 @@ function toUInt64(value: UInt64 | bigint | number | string): UInt64 {
 
 function toRootTransition(result: InternalProofResult): RootTransition {
     return {
-        initialRoot: result.initialState.root.toString(),
-        newRoot: result.newState.root.toString(),
+        initialRoot: result.initialRoot.toString(),
+        newRoot: result.newRoot.toString(),
     };
 }
 
@@ -105,8 +103,6 @@ function installGpuProofHook() {
                 : -1;
 
         console.log(`GPU prover hook called for proof index=${callIndex}`);
-
-        // Temporary fallback to validate the o1js gpuProving plumbing.
         return await cpuFallback();
     });
 }
@@ -122,17 +118,23 @@ export async function createVaultRollupProofHarness(
     installGpuProofHook();
     installGpuMsmHook();
 
-    const tree = new MerkleTree(BALANCES_TREE_HEIGHT);
+    const balances = new MerkleMap();
+    let totalsLeaf = new VaultTotalsLeaf({
+        totalAssets: UInt64.zero,
+        totalShares: UInt64.zero,
+    });
+    balances.set(TOTALS_KEY, totalsLeaf.hash());
 
     const ownerKey = PrivateKey.random();
     const owner = ownerKey.toPublicKey();
+    const accountKey = deriveAccountKey(owner);
 
-    const accountIndex = 0n;
+    if (accountKey.equals(TOTALS_KEY).toBoolean()) {
+        throw new Error('Owner hash mapped to reserved totals key 0.');
+    }
 
     let accountState: LocalAccountState | undefined;
     let proofs: MinaVaultRollupProof[] = [];
-    let totalAssets = UInt64.zero;
-    let totalShares = UInt64.zero;
 
     console.log('Compiling MinaVaultRollup...');
     const compileStartMs = nowMs();
@@ -146,31 +148,22 @@ export async function createVaultRollupProofHarness(
     logPhase('compile', compileStartMs);
 
     function currentRoot() {
-        return tree.getRoot();
+        return balances.getRoot();
     }
 
     function currentRootString() {
         return currentRoot().toString();
     }
 
-    function currentState() {
-        return new VaultState({
-            root: currentRoot(),
-            totalAssets,
-            totalShares,
-        });
-    }
-
     function getAccountState(): LocalAccountState {
         if (accountState === undefined) {
             throw new Error('Account does not exist yet. Call proveDepositNew() first.');
         }
-
         return accountState;
     }
 
-    function getWitness(index: bigint): BalanceWitness {
-        return new BalanceWitness(tree.getWitness(index));
+    function getWitness(key: Field): MerkleMapWitness {
+        return balances.getWitness(key);
     }
 
     async function proveDepositNewInternal(
@@ -185,18 +178,24 @@ export async function createVaultRollupProofHarness(
         console.log('Proving depositNew()...');
         let phaseStartMs = nowMs();
 
-        const initialState = currentState();
-        const witness = getWitness(accountIndex);
-
+        const initialRoot = currentRoot();
+        const totalsWitness = getWitness(TOTALS_KEY);
+        const accountWitness = getWitness(accountKey);
         const { proof } = await MinaVaultRollup.depositNew(
-            initialState,
-            witness,
+            initialRoot,
+            totalsWitness,
+            totalsLeaf,
+            accountWitness,
             owner,
             amount
         );
 
         phaseStartMs = logPhase('deposit_new_prove', phaseStartMs);
 
+        totalsLeaf = new VaultTotalsLeaf({
+            totalAssets: amount,
+            totalShares: amount,
+        });
         const newLeaf = new AccountLeaf({
             owner,
             balance: amount,
@@ -204,32 +203,23 @@ export async function createVaultRollupProofHarness(
             nonce: UInt64.zero,
         });
 
-        tree.setLeaf(accountIndex, newLeaf.hash());
-        totalAssets = totalAssets.add(amount);
-        totalShares = totalShares.add(amount);
+        balances.set(TOTALS_KEY, totalsLeaf.hash());
+        balances.set(accountKey, newLeaf.hash());
 
         accountState = {
-            index: accountIndex,
+            key: accountKey,
             owner,
-            key: ownerKey,
+            privateKey: ownerKey,
             leaf: newLeaf,
         };
 
-        const newState = currentState();
-
-        proof.publicOutput.newState.root.assertEquals(newState.root);
-        proof.publicOutput.newState.totalAssets.assertEquals(newState.totalAssets);
-        proof.publicOutput.newState.totalShares.assertEquals(newState.totalShares);
+        const newRoot = currentRoot();
+        proof.publicOutput.newRoot.assertEquals(newRoot);
 
         proofs.push(proof);
-
         logPhase('deposit_new_apply_local_tree', phaseStartMs);
 
-        return {
-            proof,
-            initialState,
-            newState,
-        };
+        return { proof, initialRoot, newRoot };
     }
 
     async function proveDepositInternal(
@@ -241,51 +231,43 @@ export async function createVaultRollupProofHarness(
         console.log('Proving deposit()...');
         let phaseStartMs = nowMs();
 
-        const initialState = currentState();
-        const witness = getWitness(state.index);
-
-        const mintedShares =
-            totalShares.equals(UInt64.zero).toBoolean()
-                ? amount
-                : UInt64.from(
-                    (amount.toBigInt() * totalShares.toBigInt()) / totalAssets.toBigInt()
-                );
+        const initialRoot = currentRoot();
+        const totalsWitness = getWitness(TOTALS_KEY);
+        const accountWitness = getWitness(state.key);
+        const mintedShares = UInt64.from(
+            (amount.toBigInt() * totalsLeaf.totalShares.toBigInt()) /
+            totalsLeaf.totalAssets.toBigInt()
+        );
 
         const { proof } = await MinaVaultRollup.deposit(
-            initialState,
-            witness,
+            initialRoot,
+            totalsWitness,
+            totalsLeaf,
+            accountWitness,
             state.leaf,
             amount
         );
 
         phaseStartMs = logPhase('deposit_prove', phaseStartMs);
 
+        totalsLeaf = new VaultTotalsLeaf({
+            totalAssets: totalsLeaf.totalAssets.add(amount),
+            totalShares: totalsLeaf.totalShares.add(mintedShares),
+        });
         const newLeaf = state.leaf.addPosition(amount, mintedShares);
 
-        tree.setLeaf(state.index, newLeaf.hash());
-        totalAssets = totalAssets.add(amount);
-        totalShares = totalShares.add(mintedShares);
+        balances.set(TOTALS_KEY, totalsLeaf.hash());
+        balances.set(state.key, newLeaf.hash());
 
-        accountState = {
-            ...state,
-            leaf: newLeaf,
-        };
+        accountState = { ...state, leaf: newLeaf };
 
-        const newState = currentState();
-
-        proof.publicOutput.newState.root.assertEquals(newState.root);
-        proof.publicOutput.newState.totalAssets.assertEquals(newState.totalAssets);
-        proof.publicOutput.newState.totalShares.assertEquals(newState.totalShares);
+        const newRoot = currentRoot();
+        proof.publicOutput.newRoot.assertEquals(newRoot);
 
         proofs.push(proof);
-
         logPhase('deposit_apply_local_tree', phaseStartMs);
 
-        return {
-            proof,
-            initialState,
-            newState,
-        };
+        return { proof, initialRoot, newRoot };
     }
 
     async function proveWithdrawInternal(
@@ -297,25 +279,28 @@ export async function createVaultRollupProofHarness(
         console.log('Proving withdraw()...');
         let phaseStartMs = nowMs();
 
-        const initialState = currentState();
-        const witness = getWitness(state.index);
-        const index = witness.calculateIndex();
+        const initialRoot = currentRoot();
+        const totalsWitness = getWitness(TOTALS_KEY);
+        const accountWitness = getWitness(state.key);
 
-        const signature = Signature.create(state.key, [
+        const signature = Signature.create(state.privateKey, [
             OP_WITHDRAW,
-            initialState.root,
-            index,
+            initialRoot,
+            state.key,
             shares.value,
             state.leaf.nonce.value,
         ]);
 
         const amountOut = UInt64.from(
-            (shares.toBigInt() * totalAssets.toBigInt()) / totalShares.toBigInt()
+            (shares.toBigInt() * totalsLeaf.totalAssets.toBigInt()) /
+            totalsLeaf.totalShares.toBigInt()
         );
 
         const { proof } = await MinaVaultRollup.withdraw(
-            initialState,
-            witness,
+            initialRoot,
+            totalsWitness,
+            totalsLeaf,
+            accountWitness,
             state.leaf,
             shares,
             signature
@@ -323,71 +308,46 @@ export async function createVaultRollupProofHarness(
 
         phaseStartMs = logPhase('withdraw_prove', phaseStartMs);
 
+        totalsLeaf = new VaultTotalsLeaf({
+            totalAssets: totalsLeaf.totalAssets.sub(amountOut),
+            totalShares: totalsLeaf.totalShares.sub(shares),
+        });
         const newLeaf = state.leaf.subPosition(amountOut, shares);
 
-        tree.setLeaf(state.index, newLeaf.hash());
-        totalAssets = totalAssets.sub(amountOut);
-        totalShares = totalShares.sub(shares);
+        balances.set(TOTALS_KEY, totalsLeaf.hash());
+        balances.set(state.key, newLeaf.hash());
 
-        accountState = {
-            ...state,
-            leaf: newLeaf,
-        };
+        accountState = { ...state, leaf: newLeaf };
 
-        const newState = currentState();
-
-        proof.publicOutput.newState.root.assertEquals(newState.root);
-        proof.publicOutput.newState.totalAssets.assertEquals(newState.totalAssets);
-        proof.publicOutput.newState.totalShares.assertEquals(newState.totalShares);
+        const newRoot = currentRoot();
+        proof.publicOutput.newRoot.assertEquals(newRoot);
 
         proofs.push(proof);
-
         logPhase('withdraw_apply_local_tree', phaseStartMs);
 
-        return {
-            proof,
-            initialState,
-            newState,
-        };
+        return { proof, initialRoot, newRoot };
     }
 
     async function mergeTwoProofs(
         leftProof: MinaVaultRollupProof,
         rightProof: MinaVaultRollupProof
     ): Promise<MinaVaultRollupProof> {
-        const initialState = leftProof.publicOutput.oldState;
-
-        const { proof } = await MinaVaultRollup.merge(
-            initialState,
-            leftProof,
-            rightProof
-        );
-
+        const initialRoot = leftProof.publicOutput.oldRoot;
+        const { proof } = await MinaVaultRollup.merge(initialRoot, leftProof, rightProof);
         return proof;
     }
 
     return {
-        tree,
+        balances,
         ownerKey,
         owner,
 
         currentRoot,
         currentRootString,
 
-        proveDepositNew: async (amount) => {
-            const result = await proveDepositNewInternal(amount);
-            return toRootTransition(result);
-        },
-
-        proveDeposit: async (amount) => {
-            const result = await proveDepositInternal(amount);
-            return toRootTransition(result);
-        },
-
-        proveWithdraw: async (amount) => {
-            const result = await proveWithdrawInternal(amount);
-            return toRootTransition(result);
-        },
+        proveDepositNew: async (amount) => toRootTransition(await proveDepositNewInternal(amount)),
+        proveDeposit: async (amount) => toRootTransition(await proveDepositInternal(amount)),
+        proveWithdraw: async (amount) => toRootTransition(await proveWithdrawInternal(amount)),
 
         mergeLastTwoProofs: async () => {
             if (proofs.length < 2) {
@@ -399,16 +359,14 @@ export async function createVaultRollupProofHarness(
 
             const rightProof = proofs.pop()!;
             const leftProof = proofs.pop()!;
-
             const mergedProof = await mergeTwoProofs(leftProof, rightProof);
 
             proofs.push(mergedProof);
-
             logPhase('merge_last_two_proofs', phaseStartMs);
 
             return {
-                initialRoot: mergedProof.publicOutput.oldState.root.toString(),
-                newRoot: mergedProof.publicOutput.newState.root.toString(),
+                initialRoot: mergedProof.publicOutput.oldRoot.toString(),
+                newRoot: mergedProof.publicOutput.newRoot.toString(),
             };
         },
 
@@ -419,10 +377,9 @@ export async function createVaultRollupProofHarness(
 
             if (proofs.length === 1) {
                 const proof = proofs[0];
-
                 return {
-                    initialRoot: proof.publicOutput.oldState.root.toString(),
-                    newRoot: proof.publicOutput.newState.root.toString(),
+                    initialRoot: proof.publicOutput.oldRoot.toString(),
+                    newRoot: proof.publicOutput.newRoot.toString(),
                 };
             }
 
@@ -430,18 +387,16 @@ export async function createVaultRollupProofHarness(
             const phaseStartMs = nowMs();
 
             let mergedProof = proofs[0];
-
             for (let i = 1; i < proofs.length; i++) {
                 mergedProof = await mergeTwoProofs(mergedProof, proofs[i]);
             }
 
             proofs = [mergedProof];
-
             logPhase('merge_all_proofs', phaseStartMs);
 
             return {
-                initialRoot: mergedProof.publicOutput.oldState.root.toString(),
-                newRoot: mergedProof.publicOutput.newState.root.toString(),
+                initialRoot: mergedProof.publicOutput.oldRoot.toString(),
+                newRoot: mergedProof.publicOutput.newRoot.toString(),
             };
         },
     };
@@ -449,17 +404,9 @@ export async function createVaultRollupProofHarness(
 
 export async function run(): Promise<RootTransition> {
     const totalStartMs = nowMs();
-
     const harness = await createVaultRollupProofHarness();
-
     const result = await harness.proveDepositNew(1_000_000_000);
-    // await harness.proveDeposit(500_000_000);
-    // await harness.proveWithdraw(250_000_000);
-
-    // const result = await harness.mergeAllProofs();
-
     logPhase('run_total', totalStartMs);
-
     return result;
 }
 

@@ -1,6 +1,7 @@
 import {
+    Bool,
     Field,
-    MerkleWitness,
+    MerkleMapWitness,
     Poseidon,
     Provable,
     PublicKey,
@@ -11,11 +12,9 @@ import {
     ZkProgram,
 } from 'o1js';
 
-export const BALANCES_TREE_HEIGHT = 32;
-
-export class BalanceWitness extends MerkleWitness(BALANCES_TREE_HEIGHT) { }
-
-const EMPTY_LEAF_HASH = Field(0);
+const MERKLE_MAP_BITS = 255;
+const EMPTY_LEAF_VALUE = Field(0);
+export const TOTALS_KEY = Field(0);
 
 const OP_DEPOSIT_NEW = Field(1);
 const OP_DEPOSIT = Field(2);
@@ -41,6 +40,68 @@ function mulDivFloor(x: UInt64, y: UInt64, denominator: UInt64): UInt64 {
         .assertEquals(quotient.value.mul(denominator.value).add(remainder.value));
 
     return quotient;
+}
+
+function hashChildren(isLeft: Bool, child: Field, sibling: Field): Field {
+    const left = Provable.if(isLeft, child, sibling);
+    const right = Provable.if(isLeft, sibling, child);
+    return Poseidon.hash([left, right]);
+}
+
+export function deriveAccountKey(owner: PublicKey): Field {
+    const ownerHash = Poseidon.hash(owner.toFields());
+    return Field.fromBits(ownerHash.toBits().slice(0, 254));
+}
+
+function assertTotalsWitness(witness: MerkleMapWitness) {
+    const [, key] = witness.computeRootAndKey(EMPTY_LEAF_VALUE);
+    key.assertEquals(TOTALS_KEY);
+}
+
+function combineUpdatedLeaves(
+    totalsWitness: MerkleMapWitness,
+    newTotalsLeafValue: Field,
+    accountWitness: MerkleMapWitness,
+    newAccountLeafValue: Field
+): Field {
+    const accountSubtreeHashes: Field[] = [newAccountLeafValue];
+    for (let i = 0; i < MERKLE_MAP_BITS; i++) {
+        accountSubtreeHashes.push(
+            hashChildren(
+                accountWitness.isLefts[i],
+                accountSubtreeHashes[i],
+                accountWitness.siblings[i]
+            )
+        );
+    }
+
+    const accountHighestBitAtLevel: Bool[] = new Array(MERKLE_MAP_BITS);
+    let noHigherBits = Bool(true);
+    for (let i = MERKLE_MAP_BITS - 1; i >= 0; i--) {
+        const bitIsOne = accountWitness.isLefts[i].not();
+        accountHighestBitAtLevel[i] = noHigherBits.and(bitIsOne);
+        noHigherBits = noHigherBits.and(accountWitness.isLefts[i]);
+    }
+
+    let root = newTotalsLeafValue;
+    for (let i = 0; i < MERKLE_MAP_BITS; i++) {
+        const sibling = Provable.if(
+            accountHighestBitAtLevel[i],
+            accountSubtreeHashes[i],
+            totalsWitness.siblings[i]
+        );
+        root = hashChildren(totalsWitness.isLefts[i], root, sibling);
+    }
+    return root;
+}
+
+export class VaultTotalsLeaf extends Struct({
+    totalAssets: UInt64,
+    totalShares: UInt64,
+}) {
+    hash(): Field {
+        return Poseidon.hash([this.totalAssets.value, this.totalShares.value]);
+    }
 }
 
 export class AccountLeaf extends Struct({
@@ -80,15 +141,9 @@ export class AccountLeaf extends Struct({
     }
 }
 
-export class VaultState extends Struct({
-    root: Field,
-    totalAssets: UInt64,
-    totalShares: UInt64,
-}) { }
-
 export class VaultRollupOutput extends Struct({
-    oldState: VaultState,
-    newState: VaultState,
+    oldRoot: Field,
+    newRoot: Field,
     deposited: UInt64,
     withdrawn: UInt64,
     mintedShares: UInt64,
@@ -103,7 +158,7 @@ type RollupMethodResult = {
 
 function hashOperation(
     kind: Field,
-    index: Field,
+    key: Field,
     owner: PublicKey,
     amount: UInt64,
     shares: UInt64,
@@ -111,7 +166,7 @@ function hashOperation(
 ): Field {
     return Poseidon.hash([
         kind,
-        index,
+        key,
         ...owner.toFields(),
         amount.value,
         shares.value,
@@ -119,10 +174,10 @@ function hashOperation(
     ]);
 }
 
-function emptyOutput(state: VaultState): VaultRollupOutput {
+function emptyOutput(root: Field): VaultRollupOutput {
     return new VaultRollupOutput({
-        oldState: state,
-        newState: state,
+        oldRoot: root,
+        newRoot: root,
         deposited: UInt64.zero,
         withdrawn: UInt64.zero,
         mintedShares: UInt64.zero,
@@ -135,55 +190,74 @@ function emptyOutput(state: VaultState): VaultRollupOutput {
 export const MinaVaultRollup = ZkProgram({
     name: 'mina-vault-rollup',
 
-    publicInput: VaultState,
+    publicInput: Field,
     publicOutput: VaultRollupOutput,
 
     methods: {
         noop: {
             privateInputs: [],
 
-            async method(state: VaultState): Promise<RollupMethodResult> {
+            async method(root: Field): Promise<RollupMethodResult> {
                 return {
-                    publicOutput: emptyOutput(state),
+                    publicOutput: emptyOutput(root),
                 };
             },
         },
 
         depositNew: {
-            privateInputs: [BalanceWitness, PublicKey, UInt64],
+            privateInputs: [
+                MerkleMapWitness,
+                VaultTotalsLeaf,
+                MerkleMapWitness,
+                PublicKey,
+                UInt64,
+            ],
 
             async method(
-                oldState: VaultState,
-                witness: BalanceWitness,
+                oldRoot: Field,
+                totalsWitness: MerkleMapWitness,
+                totalsLeaf: VaultTotalsLeaf,
+                accountWitness: MerkleMapWitness,
                 owner: PublicKey,
                 amount: UInt64
             ): Promise<RollupMethodResult> {
                 amount.assertGreaterThan(UInt64.zero, 'deposit amount is zero');
 
-                const index = witness.calculateIndex();
+                assertTotalsWitness(totalsWitness);
+                const [impliedOldRoot] = totalsWitness.computeRootAndKey(totalsLeaf.hash());
+                impliedOldRoot.assertEquals(oldRoot);
+                totalsLeaf.totalAssets.assertEquals(UInt64.zero);
+                totalsLeaf.totalShares.assertEquals(UInt64.zero);
 
-                witness.calculateRoot(EMPTY_LEAF_HASH).assertEquals(oldState.root);
-                oldState.totalShares.equals(UInt64.zero).assertTrue('shares already exist');
-                oldState.totalAssets.equals(UInt64.zero).assertTrue('assets already exist');
+                const accountKey = deriveAccountKey(owner);
+                accountKey.assertNotEquals(TOTALS_KEY);
+                const [emptyAccountRoot, impliedAccountKey] =
+                    accountWitness.computeRootAndKey(EMPTY_LEAF_VALUE);
+                impliedAccountKey.assertEquals(accountKey);
+                emptyAccountRoot.assertEquals(oldRoot);
 
                 const mintedShares = amount;
-
-                const newLeaf = new AccountLeaf({
+                const newTotalsLeaf = new VaultTotalsLeaf({
+                    totalAssets: amount,
+                    totalShares: mintedShares,
+                });
+                const newAccountLeaf = new AccountLeaf({
                     owner,
                     balance: amount,
                     shares: mintedShares,
                     nonce: UInt64.zero,
                 });
 
-                const newState = new VaultState({
-                    root: witness.calculateRoot(newLeaf.hash()),
-                    totalAssets: oldState.totalAssets.add(amount),
-                    totalShares: oldState.totalShares.add(mintedShares),
-                });
+                const newRoot = combineUpdatedLeaves(
+                    totalsWitness,
+                    newTotalsLeaf.hash(),
+                    accountWitness,
+                    newAccountLeaf.hash()
+                );
 
                 const actionsHash = hashOperation(
                     OP_DEPOSIT_NEW,
-                    index,
+                    accountKey,
                     owner,
                     amount,
                     mintedShares,
@@ -192,8 +266,8 @@ export const MinaVaultRollup = ZkProgram({
 
                 return {
                     publicOutput: new VaultRollupOutput({
-                        oldState,
-                        newState,
+                        oldRoot,
+                        newRoot,
                         deposited: amount,
                         withdrawn: UInt64.zero,
                         mintedShares,
@@ -206,39 +280,59 @@ export const MinaVaultRollup = ZkProgram({
         },
 
         deposit: {
-            privateInputs: [BalanceWitness, AccountLeaf, UInt64],
+            privateInputs: [
+                MerkleMapWitness,
+                VaultTotalsLeaf,
+                MerkleMapWitness,
+                AccountLeaf,
+                UInt64,
+            ],
 
             async method(
-                oldState: VaultState,
-                witness: BalanceWitness,
+                oldRoot: Field,
+                totalsWitness: MerkleMapWitness,
+                totalsLeaf: VaultTotalsLeaf,
+                accountWitness: MerkleMapWitness,
                 currentLeaf: AccountLeaf,
                 amount: UInt64
             ): Promise<RollupMethodResult> {
                 amount.assertGreaterThan(UInt64.zero, 'deposit amount is zero');
 
-                const index = witness.calculateIndex();
+                assertTotalsWitness(totalsWitness);
+                const [impliedOldRoot] = totalsWitness.computeRootAndKey(totalsLeaf.hash());
+                impliedOldRoot.assertEquals(oldRoot);
+                totalsLeaf.totalShares.assertGreaterThan(UInt64.zero, 'vault has no shares');
+                totalsLeaf.totalAssets.assertGreaterThan(UInt64.zero, 'vault has no assets');
 
-                witness.calculateRoot(currentLeaf.hash()).assertEquals(oldState.root);
-                oldState.totalShares.assertGreaterThan(UInt64.zero, 'vault has no shares');
-                oldState.totalAssets.assertGreaterThan(UInt64.zero, 'vault has no assets');
+                const accountKey = deriveAccountKey(currentLeaf.owner);
+                accountKey.assertNotEquals(TOTALS_KEY);
+                const [accountRoot, impliedAccountKey] =
+                    accountWitness.computeRootAndKey(currentLeaf.hash());
+                impliedAccountKey.assertEquals(accountKey);
+                accountRoot.assertEquals(oldRoot);
 
                 const mintedShares = mulDivFloor(
                     amount,
-                    oldState.totalShares,
-                    oldState.totalAssets
+                    totalsLeaf.totalShares,
+                    totalsLeaf.totalAssets
                 );
                 mintedShares.assertGreaterThan(UInt64.zero, 'deposit mints zero shares');
 
-                const newLeaf = currentLeaf.addPosition(amount, mintedShares);
-                const newState = new VaultState({
-                    root: witness.calculateRoot(newLeaf.hash()),
-                    totalAssets: oldState.totalAssets.add(amount),
-                    totalShares: oldState.totalShares.add(mintedShares),
+                const newTotalsLeaf = new VaultTotalsLeaf({
+                    totalAssets: totalsLeaf.totalAssets.add(amount),
+                    totalShares: totalsLeaf.totalShares.add(mintedShares),
                 });
+                const newAccountLeaf = currentLeaf.addPosition(amount, mintedShares);
+                const newRoot = combineUpdatedLeaves(
+                    totalsWitness,
+                    newTotalsLeaf.hash(),
+                    accountWitness,
+                    newAccountLeaf.hash()
+                );
 
                 const actionsHash = hashOperation(
                     OP_DEPOSIT,
-                    index,
+                    accountKey,
                     currentLeaf.owner,
                     amount,
                     mintedShares,
@@ -247,8 +341,8 @@ export const MinaVaultRollup = ZkProgram({
 
                 return {
                     publicOutput: new VaultRollupOutput({
-                        oldState,
-                        newState,
+                        oldRoot,
+                        newRoot,
                         deposited: amount,
                         withdrawn: UInt64.zero,
                         mintedShares,
@@ -261,28 +355,44 @@ export const MinaVaultRollup = ZkProgram({
         },
 
         withdraw: {
-            privateInputs: [BalanceWitness, AccountLeaf, UInt64, Signature],
+            privateInputs: [
+                MerkleMapWitness,
+                VaultTotalsLeaf,
+                MerkleMapWitness,
+                AccountLeaf,
+                UInt64,
+                Signature,
+            ],
 
             async method(
-                oldState: VaultState,
-                witness: BalanceWitness,
+                oldRoot: Field,
+                totalsWitness: MerkleMapWitness,
+                totalsLeaf: VaultTotalsLeaf,
+                accountWitness: MerkleMapWitness,
                 currentLeaf: AccountLeaf,
                 shares: UInt64,
                 signature: Signature
             ): Promise<RollupMethodResult> {
                 shares.assertGreaterThan(UInt64.zero, 'withdraw shares is zero');
 
-                const index = witness.calculateIndex();
+                assertTotalsWitness(totalsWitness);
+                const [impliedOldRoot] = totalsWitness.computeRootAndKey(totalsLeaf.hash());
+                impliedOldRoot.assertEquals(oldRoot);
+                totalsLeaf.totalShares.assertGreaterThan(UInt64.zero, 'vault has no shares');
+                shares.assertLessThanOrEqual(totalsLeaf.totalShares, 'too many shares');
 
-                witness.calculateRoot(currentLeaf.hash()).assertEquals(oldState.root);
-                oldState.totalShares.assertGreaterThan(UInt64.zero, 'vault has no shares');
-                shares.assertLessThanOrEqual(oldState.totalShares, 'too many shares');
+                const accountKey = deriveAccountKey(currentLeaf.owner);
+                accountKey.assertNotEquals(TOTALS_KEY);
+                const [accountRoot, impliedAccountKey] =
+                    accountWitness.computeRootAndKey(currentLeaf.hash());
+                impliedAccountKey.assertEquals(accountKey);
+                accountRoot.assertEquals(oldRoot);
 
                 signature
                     .verify(currentLeaf.owner, [
                         OP_WITHDRAW,
-                        oldState.root,
-                        index,
+                        oldRoot,
+                        accountKey,
                         shares.value,
                         currentLeaf.nonce.value,
                     ])
@@ -290,21 +400,26 @@ export const MinaVaultRollup = ZkProgram({
 
                 const amount = mulDivFloor(
                     shares,
-                    oldState.totalAssets,
-                    oldState.totalShares
+                    totalsLeaf.totalAssets,
+                    totalsLeaf.totalShares
                 );
                 amount.assertGreaterThan(UInt64.zero, 'withdraw amount is zero');
 
-                const newLeaf = currentLeaf.subPosition(amount, shares);
-                const newState = new VaultState({
-                    root: witness.calculateRoot(newLeaf.hash()),
-                    totalAssets: oldState.totalAssets.sub(amount),
-                    totalShares: oldState.totalShares.sub(shares),
+                const newTotalsLeaf = new VaultTotalsLeaf({
+                    totalAssets: totalsLeaf.totalAssets.sub(amount),
+                    totalShares: totalsLeaf.totalShares.sub(shares),
                 });
+                const newAccountLeaf = currentLeaf.subPosition(amount, shares);
+                const newRoot = combineUpdatedLeaves(
+                    totalsWitness,
+                    newTotalsLeaf.hash(),
+                    accountWitness,
+                    newAccountLeaf.hash()
+                );
 
                 const actionsHash = hashOperation(
                     OP_WITHDRAW,
-                    index,
+                    accountKey,
                     currentLeaf.owner,
                     amount,
                     shares,
@@ -313,8 +428,8 @@ export const MinaVaultRollup = ZkProgram({
 
                 return {
                     publicOutput: new VaultRollupOutput({
-                        oldState,
-                        newState,
+                        oldRoot,
+                        newRoot,
                         deposited: UInt64.zero,
                         withdrawn: amount,
                         mintedShares: UInt64.zero,
@@ -330,36 +445,17 @@ export const MinaVaultRollup = ZkProgram({
             privateInputs: [SelfProof, SelfProof],
 
             async method(
-                oldState: VaultState,
-                leftProof: SelfProof<VaultState, VaultRollupOutput>,
-                rightProof: SelfProof<VaultState, VaultRollupOutput>
+                oldRoot: Field,
+                leftProof: SelfProof<Field, VaultRollupOutput>,
+                rightProof: SelfProof<Field, VaultRollupOutput>
             ): Promise<RollupMethodResult> {
                 leftProof.verify();
                 rightProof.verify();
 
-                leftProof.publicInput.root.assertEquals(oldState.root);
-                leftProof.publicInput.totalAssets.assertEquals(oldState.totalAssets);
-                leftProof.publicInput.totalShares.assertEquals(oldState.totalShares);
-                leftProof.publicOutput.oldState.root.assertEquals(oldState.root);
-                leftProof.publicOutput.oldState.totalAssets.assertEquals(oldState.totalAssets);
-                leftProof.publicOutput.oldState.totalShares.assertEquals(oldState.totalShares);
-
-                rightProof.publicInput.root.assertEquals(leftProof.publicOutput.newState.root);
-                rightProof.publicInput.totalAssets.assertEquals(
-                    leftProof.publicOutput.newState.totalAssets
-                );
-                rightProof.publicInput.totalShares.assertEquals(
-                    leftProof.publicOutput.newState.totalShares
-                );
-                rightProof.publicOutput.oldState.root.assertEquals(
-                    leftProof.publicOutput.newState.root
-                );
-                rightProof.publicOutput.oldState.totalAssets.assertEquals(
-                    leftProof.publicOutput.newState.totalAssets
-                );
-                rightProof.publicOutput.oldState.totalShares.assertEquals(
-                    leftProof.publicOutput.newState.totalShares
-                );
+                leftProof.publicInput.assertEquals(oldRoot);
+                leftProof.publicOutput.oldRoot.assertEquals(oldRoot);
+                rightProof.publicInput.assertEquals(leftProof.publicOutput.newRoot);
+                rightProof.publicOutput.oldRoot.assertEquals(leftProof.publicOutput.newRoot);
 
                 const actionsHash = Poseidon.hash([
                     leftProof.publicOutput.actionsHash,
@@ -368,29 +464,23 @@ export const MinaVaultRollup = ZkProgram({
 
                 return {
                     publicOutput: new VaultRollupOutput({
-                        oldState,
-                        newState: rightProof.publicOutput.newState,
-
+                        oldRoot,
+                        newRoot: rightProof.publicOutput.newRoot,
                         deposited: leftProof.publicOutput.deposited.add(
                             rightProof.publicOutput.deposited
                         ),
-
                         withdrawn: leftProof.publicOutput.withdrawn.add(
                             rightProof.publicOutput.withdrawn
                         ),
-
                         mintedShares: leftProof.publicOutput.mintedShares.add(
                             rightProof.publicOutput.mintedShares
                         ),
-
                         burnedShares: leftProof.publicOutput.burnedShares.add(
                             rightProof.publicOutput.burnedShares
                         ),
-
                         operations: leftProof.publicOutput.operations.add(
                             rightProof.publicOutput.operations
                         ),
-
                         actionsHash,
                     }),
                 };
